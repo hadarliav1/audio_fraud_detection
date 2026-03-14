@@ -3,8 +3,9 @@
 Fusion A/B: frozen HuBERT embeddings + optional acoustic features, LR on top.
 
 No fine-tuning — encoder used as feature extractor only. Runs three ablations:
-HF-only (768-d), acoustic-only (118-d), fusion (886-d). Same split and preprocessing
-across all for controlled comparison.
+HF-only (768-d), acoustic-only (selected), fusion (768 + selected). Acoustic features
+are selected by top univariate AUC and removal of highly correlated (>0.85) features.
+Same split and preprocessing across all for controlled comparison.
 """
 
 import json
@@ -17,6 +18,7 @@ import numpy as np
 import pandas as pd
 import torch
 from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score
 from sklearn.preprocessing import StandardScaler
 from transformers import AutoFeatureExtractor, AutoModelForAudioClassification
 
@@ -42,6 +44,37 @@ TRANSFORMER_CKPT = OUTPUTS_DIR / "transformer_hubert_base_ls960"
 MAX_AUDIO_SAMPLES = int(5.0 * SAMPLE_RATE)
 LR_C = 0.1
 USE_FROZEN = True
+
+# Feature selection: top by AUC, then drop highly correlated
+TOP_ACOUSTIC_N = 30
+CORR_THRESHOLD = 0.85
+
+
+def select_acoustic_features(
+    X: np.ndarray, y: np.ndarray, top_n: int = TOP_ACOUSTIC_N, corr_threshold: float = CORR_THRESHOLD
+) -> np.ndarray:
+    """Select acoustic features: top by univariate AUC, then remove highly correlated."""
+    n_feats = X.shape[1]
+    aucs = []
+    for j in range(n_feats):
+        col = X[:, j]
+        if np.std(col) < 1e-9 or np.any(np.isnan(col)):
+            aucs.append(0.5)
+            continue
+        auc = roc_auc_score(y, col)
+        aucs.append(max(auc, 1 - auc))  # symmetry: either direction is discriminative
+    aucs = np.array(aucs)
+    top_idx = np.argsort(aucs)[::-1][:top_n]
+
+    # Remove highly correlated: keep first of each correlated pair
+    X_top = X[:, top_idx]
+    corr = np.corrcoef(X_top.T)
+    np.fill_diagonal(corr, 0)
+    keep = []
+    for i in range(len(top_idx)):
+        if all(np.abs(corr[i, j]) < corr_threshold for j in keep):
+            keep.append(i)
+    return top_idx[keep]
 
 
 def _get_encoder(model):
@@ -201,7 +234,14 @@ def main() -> int:
     X_tr_ac = np.nan_to_num(X_tr_ac, nan=train_median)
     X_val_ac = np.nan_to_num(X_val_ac, nan=train_median)
     X_te_ac = np.nan_to_num(X_te_ac, nan=train_median)
-    print(f"Acoustic features: {X_tr_ac.shape[1]}-d")
+    print(f"Acoustic features (raw): {X_tr_ac.shape[1]}-d")
+
+    # Feature selection: top by AUC, drop correlated
+    sel_idx = select_acoustic_features(X_tr_ac, y_tr, top_n=TOP_ACOUSTIC_N, corr_threshold=CORR_THRESHOLD)
+    X_tr_ac = X_tr_ac[:, sel_idx]
+    X_val_ac = X_val_ac[:, sel_idx]
+    X_te_ac = X_te_ac[:, sel_idx]
+    print(f"Acoustic features (selected): {X_tr_ac.shape[1]}-d")
 
     # 4. Run three experiments
     results = []
@@ -275,6 +315,7 @@ def main() -> int:
             "test_auc_fusion": fusion_te,
             "fusion_minus_hf": delta_hf,
             "conclusion": conclusion,
+            "selected_acoustic_dim": int(X_tr_ac.shape[1]),
         },
     }
     with open(OUTPUTS_DIR / "fusion_ab_results.json", "w") as f:

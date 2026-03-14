@@ -24,3 +24,6 @@ outputs/
 
 # OS
 .DS_Store
+
+#md files
+*.md

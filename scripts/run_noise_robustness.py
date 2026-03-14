@@ -2,9 +2,10 @@
 """
 Stage 8 — Noise Robustness: Measure model degradation under white, pink, and compression noise.
 
-For each model (transformers, CNN, RF) and each (noise_type, SNR), corrupt test audio
+For each model (transformers, CNN, RF, fusion) and each (noise_type, SNR), corrupt test audio
 and evaluate. Output: degradation curves for analysis.
 
+Fusion = frozen HuBERT embeddings + acoustic features + LR (trained on clean, evaluated on noisy).
 Noise types: white (flat spectrum), pink (1/f), compression (codec-like simulation).
 SNR levels: clean (inf), 20, 10, 5, 0 dB.
 """
@@ -19,6 +20,9 @@ import numpy as np
 import pandas as pd
 import torch
 from scipy import signal
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score
+from sklearn.preprocessing import StandardScaler
 from transformers import AutoFeatureExtractor, AutoModelForAudioClassification
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -48,6 +52,10 @@ from src.utils.paths import get_audio_paths_with_labels
 from src.utils.splits import speaker_disjoint_split
 
 MAX_AUDIO_SAMPLES = int(5.0 * SAMPLE_RATE)
+BEST_TRANSFORMER = "facebook/hubert-base-ls960"
+FUSION_TOP_ACOUSTIC_N = 30
+FUSION_CORR_THRESHOLD = 0.85
+LR_C = 0.1
 
 
 def model_short_name(model_id: str) -> str:
@@ -58,6 +66,64 @@ def model_short_name(model_id: str) -> str:
             name = name[: -len(suffix)]
             break
     return name.replace("-", "_")
+
+
+def _get_encoder(model):
+    """Get encoder submodule (hubert, wav2vec2, wavlm)."""
+    for attr in ("hubert", "wav2vec2", "wavlm"):
+        enc = getattr(model, attr, None)
+        if enc is not None:
+            return enc
+    raise ValueError("Unknown model type: no encoder found")
+
+
+def extract_embeddings_from_arrays(model, feature_extractor, arrays, device, batch_size=16):
+    """Extract mean-pooled embeddings from audio arrays."""
+    model.eval()
+    encoder = _get_encoder(model)
+    embeddings = []
+    for i in range(0, len(arrays), batch_size):
+        batch = arrays[i : i + batch_size]
+        batch = [a.astype(np.float32) for a in batch]
+        inputs = feature_extractor(
+            batch, sampling_rate=SAMPLE_RATE, return_tensors="pt",
+            padding=True, truncation=True, max_length=MAX_AUDIO_SAMPLES,
+        )
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        with torch.no_grad():
+            out = encoder(**inputs)
+            hidden = out.last_hidden_state
+            mask = inputs.get("attention_mask")
+            if mask is not None:
+                mask = mask.unsqueeze(-1).float()
+                pooled = (hidden * mask).sum(1) / mask.sum(1).clamp(min=1e-9)
+            else:
+                pooled = hidden.mean(1)
+        embeddings.append(pooled.cpu().numpy())
+    return np.vstack(embeddings)
+
+
+def select_acoustic_features(X: np.ndarray, y: np.ndarray, top_n: int = FUSION_TOP_ACOUSTIC_N, corr_threshold: float = FUSION_CORR_THRESHOLD) -> np.ndarray:
+    """Select acoustic features: top by univariate AUC, then remove highly correlated."""
+    n_feats = X.shape[1]
+    aucs = []
+    for j in range(n_feats):
+        col = X[:, j]
+        if np.std(col) < 1e-9 or np.any(np.isnan(col)):
+            aucs.append(0.5)
+            continue
+        auc = roc_auc_score(y, col)
+        aucs.append(max(auc, 1 - auc))
+    aucs = np.array(aucs)
+    top_idx = np.argsort(aucs)[::-1][:top_n]
+    X_top = X[:, top_idx]
+    corr = np.corrcoef(X_top.T)
+    np.fill_diagonal(corr, 0)
+    keep = []
+    for i in range(len(top_idx)):
+        if all(np.abs(corr[i, j]) < corr_threshold for j in keep):
+            keep.append(i)
+    return top_idx[keep]
 
 
 def add_white_noise(y: np.ndarray, snr_db: float, rng: np.random.Generator) -> np.ndarray:
@@ -193,6 +259,40 @@ def evaluate_rf(test_paths, test_labels, noise_type, snr_db, pipe, rng):
     return evaluate_binary(np.array(test_labels), pred, prob)
 
 
+def evaluate_fusion(test_paths, test_labels, noise_type, snr_db, fusion_state, device, rng):
+    """Run fusion (HuBERT emb + acoustic) on corrupted audio."""
+    scaler, lr, sel_idx, model, feature_extractor = (
+        fusion_state["scaler"], fusion_state["lr"], fusion_state["sel_idx"],
+        fusion_state["model"], fusion_state["feature_extractor"],
+    )
+    arrays = []
+    X_ac = []
+    for p in test_paths:
+        y = load_audio(p, sr=SAMPLE_RATE)
+        y = corrupt_audio(y.astype(np.float32), noise_type, snr_db, SAMPLE_RATE, rng)
+        if len(y) > MAX_AUDIO_SAMPLES:
+            start = (len(y) - MAX_AUDIO_SAMPLES) // 2
+            y = y[start : start + MAX_AUDIO_SAMPLES]
+        elif len(y) < MAX_AUDIO_SAMPLES:
+            y = np.pad(y, (0, MAX_AUDIO_SAMPLES - len(y)), mode="constant")
+        arrays.append(y)
+        feat = extract_all_features(
+            y, sr=SAMPLE_RATE, n_mfcc=13, n_mels=N_MELS, hop_length=HOP_LENGTH,
+            n_fft=N_FFT, f0_fmin=F0_FMIN, f0_fmax=F0_FMAX,
+        )
+        vec = features_to_vector(feat)
+        X_ac.append(vec)
+    X_ac = np.array(X_ac)
+    X_ac = np.nan_to_num(X_ac, nan=np.nanmedian(X_ac, axis=0))
+    X_ac = X_ac[:, sel_idx]
+    emb = extract_embeddings_from_arrays(model, feature_extractor, arrays, device)
+    X = np.hstack([emb, X_ac])
+    X_s = scaler.transform(X)
+    pred = lr.predict(X_s)
+    prob = lr.predict_proba(X_s)[:, 1]
+    return evaluate_binary(np.array(test_labels), pred, prob)
+
+
 def main() -> int:
     OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
     np.random.seed(RANDOM_SEED)
@@ -206,10 +306,12 @@ def main() -> int:
         return 1
 
     val_ratio = VAL_SIZE / (1 - TEST_SIZE)
-    _, _, test_pairs = speaker_disjoint_split(pairs, TEST_SIZE, val_ratio, RANDOM_SEED)
+    tr_pairs, _, test_pairs = speaker_disjoint_split(pairs, TEST_SIZE, val_ratio, RANDOM_SEED)
+    train_paths = [p for p, _ in tr_pairs]
+    train_labels = np.array([l for _, l in tr_pairs])
     test_paths = [p for p, _ in test_pairs]
     test_labels = [l for _, l in test_pairs]
-    print(f"Test set: {len(test_paths)} samples")
+    print(f"Train set: {len(train_paths)}, Test set: {len(test_paths)} samples")
 
     results = {}
 
@@ -274,6 +376,50 @@ def main() -> int:
                 print(f"  {noise_type} {label}: AUC={m['auc_roc']:.3f}")
     else:
         print("No RF checkpoint. Run: python scripts/train_baseline.py")
+
+    # 4. Fusion (frozen HuBERT + acoustic features + LR)
+    print("\nEvaluating Fusion (HuBERT + Acoustic)...")
+    model = AutoModelForAudioClassification.from_pretrained(BEST_TRANSFORMER, num_labels=2)
+    feature_extractor = AutoFeatureExtractor.from_pretrained(BEST_TRANSFORMER)
+    model = model.to(device)
+    # Extract embeddings from clean train
+    train_arrays = []
+    for p in train_paths:
+        y = load_audio(p, sr=SAMPLE_RATE)
+        if len(y) > MAX_AUDIO_SAMPLES:
+            start = (len(y) - MAX_AUDIO_SAMPLES) // 2
+            y = y[start : start + MAX_AUDIO_SAMPLES]
+        elif len(y) < MAX_AUDIO_SAMPLES:
+            y = np.pad(y, (0, MAX_AUDIO_SAMPLES - len(y)), mode="constant")
+        train_arrays.append(y.astype(np.float32))
+    tr_emb = extract_embeddings_from_arrays(model, feature_extractor, train_arrays, device)
+    # Extract acoustic from clean train
+    X_tr_ac = []
+    for p in train_paths:
+        y = load_audio(p, sr=SAMPLE_RATE)
+        feat = extract_all_features(
+            y, sr=SAMPLE_RATE, n_mfcc=13, n_mels=N_MELS, hop_length=HOP_LENGTH,
+            n_fft=N_FFT, f0_fmin=F0_FMIN, f0_fmax=F0_FMAX,
+        )
+        X_tr_ac.append(features_to_vector(feat))
+    X_tr_ac = np.array(X_tr_ac)
+    X_tr_ac = np.nan_to_num(X_tr_ac, nan=np.nanmedian(X_tr_ac, axis=0))
+    sel_idx = select_acoustic_features(X_tr_ac, train_labels, top_n=FUSION_TOP_ACOUSTIC_N, corr_threshold=FUSION_CORR_THRESHOLD)
+    X_tr_ac = X_tr_ac[:, sel_idx]
+    X_tr = np.hstack([tr_emb, X_tr_ac])
+    scaler = StandardScaler()
+    X_tr_s = scaler.fit_transform(X_tr)
+    lr = LogisticRegression(C=LR_C, max_iter=1000, random_state=RANDOM_SEED)
+    lr.fit(X_tr_s, train_labels)
+    fusion_state = {"scaler": scaler, "lr": lr, "sel_idx": sel_idx, "model": model, "feature_extractor": feature_extractor}
+    results["fusion"] = {}
+    for noise_type in NOISE_TYPES:
+        results["fusion"][noise_type] = {}
+        for snr in SNR_LEVELS_DB:
+            label = "clean" if snr == float("inf") else f"{int(snr)}dB"
+            m = evaluate_fusion(test_paths, test_labels, noise_type, snr, fusion_state, device, rng)
+            results["fusion"][noise_type][label] = {"auc": m["auc_roc"], "f1": m["f1"]}
+            print(f"  {noise_type} {label}: AUC={m['auc_roc']:.3f}")
 
     with open(OUTPUTS_DIR / "noise_robustness_results.json", "w") as f:
         json.dump(results, f, indent=2)
