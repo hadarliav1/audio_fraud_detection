@@ -2,10 +2,14 @@
 """
 Stage 8 — Noise Robustness: Measure model degradation under white, pink, and compression noise.
 
-For each model (transformers, CNN, RF, fusion) and each (noise_type, SNR), corrupt test audio
-and evaluate. Output: degradation curves for analysis.
+For each model (transformers, CNN, RF, hubert_frozen_lr, fusion) and each (noise_type, SNR),
+corrupt test audio and evaluate. Output: degradation curves for analysis.
 
-Fusion = frozen HuBERT embeddings + acoustic features + LR (trained on clean, evaluated on noisy).
+- hubert_base_ls960 (etc.): fine-tuned transformer from checkpoint (encoder + trained head).
+- hubert_frozen_lr: frozen HuBERT encoder + LR on embeddings only — same pipeline as notebook 07
+  "HuBERT Embeddings Only", for fair comparison with Fusion.
+- Fusion: frozen HuBERT embeddings + acoustic features + LR (trained on clean, evaluated on noisy).
+
 Noise types: white (flat spectrum), pink (1/f), compression (codec-like simulation).
 SNR levels: clean (inf), 20, 10, 5, 0 dB.
 """
@@ -259,6 +263,28 @@ def evaluate_rf(test_paths, test_labels, noise_type, snr_db, pipe, rng):
     return evaluate_binary(np.array(test_labels), pred, prob)
 
 
+def evaluate_frozen_hubert_lr(test_paths, test_labels, noise_type, snr_db, state, device, rng):
+    """Run frozen HuBERT encoder + LR (no acoustic). Same pipeline as 07 'HuBERT Embeddings Only'."""
+    scaler, lr, model, feature_extractor = (
+        state["scaler"], state["lr"], state["model"], state["feature_extractor"],
+    )
+    arrays = []
+    for p in test_paths:
+        y = load_audio(p, sr=SAMPLE_RATE)
+        y = corrupt_audio(y.astype(np.float32), noise_type, snr_db, SAMPLE_RATE, rng)
+        if len(y) > MAX_AUDIO_SAMPLES:
+            start = (len(y) - MAX_AUDIO_SAMPLES) // 2
+            y = y[start : start + MAX_AUDIO_SAMPLES]
+        elif len(y) < MAX_AUDIO_SAMPLES:
+            y = np.pad(y, (0, MAX_AUDIO_SAMPLES - len(y)), mode="constant")
+        arrays.append(y)
+    emb = extract_embeddings_from_arrays(model, feature_extractor, arrays, device)
+    X_s = scaler.transform(emb)
+    pred = lr.predict(X_s)
+    prob = lr.predict_proba(X_s)[:, 1]
+    return evaluate_binary(np.array(test_labels), pred, prob)
+
+
 def evaluate_fusion(test_paths, test_labels, noise_type, snr_db, fusion_state, device, rng):
     """Run fusion (HuBERT emb + acoustic) on corrupted audio."""
     scaler, lr, sel_idx, model, feature_extractor = (
@@ -377,7 +403,36 @@ def main() -> int:
     else:
         print("No RF checkpoint. Run: python scripts/train_baseline.py")
 
-    # 4. Fusion (frozen HuBERT + acoustic features + LR)
+    # 4a. HuBERT frozen + LR (same as 07 "HuBERT Embeddings Only" — fair comparison to Fusion)
+    print("\nEvaluating HuBERT (frozen + LR, same as notebook 07)...")
+    model_frozen = AutoModelForAudioClassification.from_pretrained(BEST_TRANSFORMER, num_labels=2)
+    feat_ext_frozen = AutoFeatureExtractor.from_pretrained(BEST_TRANSFORMER)
+    model_frozen = model_frozen.to(device)
+    train_arrays_emb = []
+    for p in train_paths:
+        y = load_audio(p, sr=SAMPLE_RATE)
+        if len(y) > MAX_AUDIO_SAMPLES:
+            start = (len(y) - MAX_AUDIO_SAMPLES) // 2
+            y = y[start : start + MAX_AUDIO_SAMPLES]
+        elif len(y) < MAX_AUDIO_SAMPLES:
+            y = np.pad(y, (0, MAX_AUDIO_SAMPLES - len(y)), mode="constant")
+        train_arrays_emb.append(y.astype(np.float32))
+    tr_emb_only = extract_embeddings_from_arrays(model_frozen, feat_ext_frozen, train_arrays_emb, device)
+    scaler_emb = StandardScaler()
+    X_tr_emb_s = scaler_emb.fit_transform(tr_emb_only)
+    lr_emb = LogisticRegression(C=LR_C, max_iter=1000, random_state=RANDOM_SEED)
+    lr_emb.fit(X_tr_emb_s, train_labels)
+    hubert_frozen_state = {"scaler": scaler_emb, "lr": lr_emb, "model": model_frozen, "feature_extractor": feat_ext_frozen}
+    results["hubert_frozen_lr"] = {}
+    for noise_type in NOISE_TYPES:
+        results["hubert_frozen_lr"][noise_type] = {}
+        for snr in SNR_LEVELS_DB:
+            label = "clean" if snr == float("inf") else f"{int(snr)}dB"
+            m = evaluate_frozen_hubert_lr(test_paths, test_labels, noise_type, snr, hubert_frozen_state, device, rng)
+            results["hubert_frozen_lr"][noise_type][label] = {"auc": m["auc_roc"], "f1": m["f1"]}
+            print(f"  {noise_type} {label}: AUC={m['auc_roc']:.3f}")
+
+    # 4b. Fusion (frozen HuBERT + acoustic features + LR)
     print("\nEvaluating Fusion (HuBERT + Acoustic)...")
     model = AutoModelForAudioClassification.from_pretrained(BEST_TRANSFORMER, num_labels=2)
     feature_extractor = AutoFeatureExtractor.from_pretrained(BEST_TRANSFORMER)
