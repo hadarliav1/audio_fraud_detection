@@ -1,0 +1,31 @@
+{
+  "train": {
+    "n_speakers": 248,
+    "n_samples": 2446,
+    "label_counts": {
+      "real": 864,
+      "fake": 1582
+    }
+  },
+  "val": {
+    "n_speakers": 35,
+    "n_samples": 747,
+    "label_counts": {
+      "real": 670,
+      "fake": 77
+    }
+  },
+  "test": {
+    "n_speakers": 70,
+    "n_samples": 1118,
+    "label_counts": {
+      "real": 740,
+      "fake": 378
+    }
+  },
+  "overlap": {
+    "train_val": false,
+    "train_test": false,
+    "val_test": false
+  }
+}

@@ -6,7 +6,20 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 
+# Data (large, download separately)
+data/raw/
+data/processed/
+data/features/
 
+# Outputs (models, results — regenerate with scripts)
+outputs/
+
+# Ignore heavy result artifacts but keep summary JSONs and README
+results/*
+!results/*.json
+!results/README.md
+
+reports/
 
 # IDE / env
 .cursor/
@@ -21,8 +34,4 @@ __pycache__/
 
 #md files
 *.md
-
-# Data & generated artifacts
-data/
-results/
-reports/
+!results/README.md
