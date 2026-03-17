@@ -6,13 +6,7 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 
-# Data (large, download separately)
-data/raw/
-data/processed/
-data/features/
 
-# Outputs (models, results — regenerate with scripts)
-outputs/
 
 # IDE / env
 .cursor/
@@ -27,3 +21,8 @@ outputs/
 
 #md files
 *.md
+
+# Data & generated artifacts
+data/
+results/
+reports/

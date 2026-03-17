@@ -34,7 +34,7 @@ from config import (
 )
 from src.utils.eval import evaluate_binary
 from src.utils.paths import get_audio_paths_with_labels
-from src.utils.splits import speaker_disjoint_split
+from src.utils.splits import load_split, save_split, speaker_disjoint_split, SPLIT_FILENAME
 
 
 def model_short_name(model_id: str) -> str:
@@ -50,19 +50,29 @@ def model_short_name(model_id: str) -> str:
 
 def main() -> int:
     OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
+    # Remove previous run so re-runs don't mix old and new results (mission reproducibility)
+    out_file = OUTPUTS_DIR / "transformer_results.json"
+    if out_file.exists():
+        out_file.unlink()
     np.random.seed(RANDOM_SEED)
 
-    pairs = get_audio_paths_with_labels(PROCESSED_DIR)
-    if not pairs:
-        print("No processed audio. Run: python scripts/run_preprocessing.py")
-        return 1
-
-    val_ratio = VAL_SIZE / (1 - TEST_SIZE)
-    tr_pairs, val_pairs, test_pairs = speaker_disjoint_split(
-        pairs, TEST_SIZE, val_ratio, RANDOM_SEED
-    )
-    if not val_pairs:
-        val_pairs = tr_pairs[: len(tr_pairs) // 10]
+    split_path = OUTPUTS_DIR / SPLIT_FILENAME
+    loaded = load_split(split_path) if split_path.exists() else None
+    if loaded is not None:
+        tr_pairs, val_pairs, test_pairs = loaded
+        print("Using same split as CNN (results/split.json)")
+    else:
+        pairs = get_audio_paths_with_labels(PROCESSED_DIR)
+        if not pairs:
+            print("No processed audio. Run: python scripts/run_preprocessing.py")
+            return 1
+        val_ratio = VAL_SIZE / (1 - TEST_SIZE)
+        tr_pairs, val_pairs, test_pairs = speaker_disjoint_split(
+            pairs, TEST_SIZE, val_ratio, RANDOM_SEED
+        )
+        if not val_pairs:
+            val_pairs = tr_pairs[: len(tr_pairs) // 10]
+        save_split(tr_pairs, val_pairs, test_pairs, split_path)
 
     train_paths = [str(p) for p, _ in tr_pairs]
     train_labels = [l for _, l in tr_pairs]
@@ -101,8 +111,10 @@ def main() -> int:
 
     for model_id in TRANSFORMER_MODELS:
         short = model_short_name(model_id)
-        print(f"\n--- Training {model_id} ---")
         out_subdir = OUTPUTS_DIR / f"transformer_{short}"
+        results_file = out_subdir / "results.json"
+
+        print(f"\n--- {model_id} ---")
         out_subdir.mkdir(parents=True, exist_ok=True)
 
         feature_extractor = AutoFeatureExtractor.from_pretrained(model_id)
@@ -168,21 +180,69 @@ def main() -> int:
             compute_metrics=compute_metrics,
         )
 
-        trainer.train()
-        trainer.save_model(str(out_subdir))
+        # If a fine-tuned checkpoint already exists, reuse it and only recompute metrics
+        if not any(out_subdir.iterdir()):
+            trainer.train()
+            trainer.save_model(str(out_subdir))
+        else:
+            print("  Using existing checkpoint (eval-only).")
 
-        preds = trainer.predict(enc_test)
-        y_pred = np.argmax(preds.predictions, axis=1)
-        logits = preds.predictions - preds.predictions.max(axis=1, keepdims=True)
-        probs = np.exp(logits) / np.exp(logits).sum(axis=1, keepdims=True)
-        y_prob = probs[:, 1]
+        def _probs_from_preds(preds):
+            logits = preds.predictions - preds.predictions.max(axis=1, keepdims=True)
+            probs = np.exp(logits) / np.exp(logits).sum(axis=1, keepdims=True)
+            y_prob = probs[:, 1]
+            return y_prob
 
-        metrics = evaluate_binary(preds.label_ids, y_pred, y_prob)
-        all_results[short] = metrics
+        # Predict once to get probabilities
+        pred_train = trainer.predict(enc_train)
+        pred_val = trainer.predict(enc_val)
+        pred_test = trainer.predict(enc_test)
 
-        with open(out_subdir / "results.json", "w") as f:
-            json.dump(metrics, f, indent=2)
-        print(f"  Test AUC: {metrics['auc_roc']:.3f}")
+        y_val = pred_val.label_ids
+        prob_val = _probs_from_preds(pred_val)
+
+        # Choose threshold to maximise validation F1 (balanced precision/recall)
+        best_threshold = 0.5
+        best_score = -1.0
+        for t in np.linspace(0.05, 0.95, 19):
+            y_pred_val = (prob_val >= t).astype(np.int64)
+            m_val = evaluate_binary(y_val, y_pred_val, prob_val)
+            score = m_val["f1"]
+            if score >= best_score:
+                best_score = score
+                best_threshold = float(t)
+
+        def metrics_at_threshold(preds, threshold: float):
+            y_true = preds.label_ids
+            prob = _probs_from_preds(preds)
+            y_pred = (prob >= threshold).astype(np.int64)
+            return evaluate_binary(y_true, y_pred, prob)
+
+        train_metrics = metrics_at_threshold(pred_train, best_threshold)
+        val_metrics = metrics_at_threshold(pred_val, best_threshold)
+        test_metrics = metrics_at_threshold(pred_test, best_threshold)
+
+        all_results[short] = {
+            "decision_threshold": best_threshold,
+            **test_metrics,
+            "train": train_metrics,
+            "val": val_metrics,
+        }
+
+        out_results = {
+            "decision_threshold": best_threshold,
+            **test_metrics,
+            "train": train_metrics,
+            "val": val_metrics,
+        }
+        with open(results_file, "w") as f:
+            json.dump(out_results, f, indent=2)
+        print(
+            f"  Threshold: {best_threshold:.3f}  "
+            f"Train AUC: {train_metrics['auc_roc']:.3f}  "
+            f"Val AUC: {val_metrics['auc_roc']:.3f}  "
+            f"Test AUC: {test_metrics['auc_roc']:.3f}"
+        )
 
     with open(OUTPUTS_DIR / "transformer_results.json", "w") as f:
         json.dump(all_results, f, indent=2)

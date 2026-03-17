@@ -4,9 +4,12 @@ Predict real vs fake for a single audio file.
 
   python scripts/predict.py path/to/audio.wav
   python scripts/predict.py --model {wav2vec2|cnn|rf} path/to/audio.wav
+
+When --model cnn: uses SpectrogramCNN if baseline was mel, or AcousticMLP if baseline was acoustic.
 """
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -28,6 +31,7 @@ from config import (
     SAMPLE_RATE,
 )
 from src.features.acoustic_scipy import extract_all_features, features_to_vector, get_feature_names
+from src.models.acoustic_mlp import AcousticMLP
 from src.models.cnn_spectrogram import SpectrogramCNN
 from src.utils.audio import load_audio
 
@@ -53,7 +57,20 @@ def predict_rf(audio_path: Path) -> tuple:
 
 
 def predict_cnn(audio_path: Path, device: torch.device) -> tuple:
-    """CNN: mel-spectrogram -> predict."""
+    """Baseline: acoustic MLP or mel CNN depending on saved architecture."""
+    cnn_results_path = OUTPUTS_DIR / "cnn_results.json"
+    arch = None
+    if cnn_results_path.exists():
+        try:
+            with open(cnn_results_path) as f:
+                arch = json.load(f).get("architecture")
+        except Exception:
+            pass
+
+    if arch == "acoustic_mlp":
+        return _predict_acoustic_mlp(audio_path, device)
+
+    # Mel spectrogram CNN (or ResNet)
     model = SpectrogramCNN(n_mels=N_MELS, n_classes=2)
     model.load_state_dict(torch.load(OUTPUTS_DIR / "cnn_spectrogram.pt", map_location=device, weights_only=True))
     model = model.to(device).eval()
@@ -76,6 +93,38 @@ def predict_cnn(audio_path: Path, device: torch.device) -> tuple:
         logits = model(x)
     prob = torch.softmax(logits, dim=1)[0, 1].item()
     pred = 1 if prob >= 0.5 else 0
+    return pred, prob
+
+
+def _predict_acoustic_mlp(audio_path: Path, device: torch.device) -> tuple:
+    """Acoustic MLP: extract features -> select -> standardize -> predict."""
+    with open(OUTPUTS_DIR / "acoustic_baseline_config.json") as f:
+        cfg = json.load(f)
+    sel_idx = np.array(cfg["sel_idx"])
+    train_median = np.array(cfg["train_median"])
+    scaler_path = OUTPUTS_DIR / "acoustic_baseline_scaler.joblib"
+    scaler = joblib.load(scaler_path) if scaler_path.exists() else None
+
+    y = load_audio(audio_path, sr=SAMPLE_RATE)
+    feat = extract_all_features(
+        y, sr=SAMPLE_RATE, n_mfcc=13, n_mels=N_MELS, hop_length=HOP_LENGTH,
+        n_fft=N_FFT, f0_fmin=F0_FMIN, f0_fmax=F0_FMAX,
+    )
+    vec = features_to_vector(feat)  # same order as CSV / get_feature_names()
+    vec = np.nan_to_num(vec.reshape(1, -1).astype(np.float64), nan=train_median)
+    vec = vec[:, sel_idx]
+    if scaler is not None:
+        vec = scaler.transform(vec)
+
+    model = AcousticMLP(n_input=len(sel_idx), n_classes=2)
+    model.load_state_dict(torch.load(OUTPUTS_DIR / "cnn_spectrogram.pt", map_location=device, weights_only=True))
+    model = model.to(device).eval()
+    with open(OUTPUTS_DIR / "cnn_results.json") as f:
+        threshold = json.load(f).get("decision_threshold", 0.5)
+    with torch.no_grad():
+        logits = model(torch.from_numpy(vec).float().to(device))
+    prob = torch.softmax(logits, dim=1)[0, 1].item()
+    pred = 1 if prob >= threshold else 0
     return pred, prob
 
 

@@ -25,6 +25,10 @@ from src.utils.splits import speaker_disjoint_split
 def main() -> int:
     FEATURES_DIR.mkdir(parents=True, exist_ok=True)
     OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
+    # Remove previous run so re-runs don't mix old and new results (mission reproducibility)
+    out_file = OUTPUTS_DIR / "baseline_results.json"
+    if out_file.exists():
+        out_file.unlink()
 
     df = pd.read_csv(FEATURES_DIR / "acoustic_features.csv")
     if df.empty:
@@ -68,12 +72,21 @@ def main() -> int:
         ("logistic_regression", make_lr_pipeline(random_state=RANDOM_SEED)),
     ]:
         pipe.fit(X_tr, y_tr)
+        # Train metrics
+        tr_pred = pipe.predict(X_tr)
+        tr_prob = pipe.predict_proba(X_tr)[:, 1]
+        train_metrics = evaluate_binary(y_tr.values, tr_pred, tr_prob)
+        # Val metrics
+        val_pred = pipe.predict(X_val)
+        val_prob = pipe.predict_proba(X_val)[:, 1]
+        val_metrics = evaluate_binary(y_val.values, val_pred, val_prob)
+        # Test metrics
         y_pred = pipe.predict(X_te)
         y_prob = pipe.predict_proba(X_te)[:, 1]
         metrics = evaluate_binary(y_te.values, y_pred, y_prob)
         ci = evaluate_binary_bootstrap(y_te.values, y_pred, y_prob, n_bootstrap=500)
         metrics["auc_ci_95"] = ci.get("auc_ci_95", [0, 0])
-        results[name] = metrics
+        results[name] = {**metrics, "train": train_metrics, "val": val_metrics}
 
         imp = get_feature_importance(pipe, feature_names)
         imp_sorted = sorted(imp.items(), key=lambda x: -x[1])[:20]

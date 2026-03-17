@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
 """
-Stage 8 — Noise Robustness: Measure model degradation under white, pink, and compression noise.
+Stage 8 — Noise Robustness: Train and evaluate models on noisy data.
 
-For each model (transformers, CNN, RF, hubert_frozen_lr, fusion) and each (noise_type, SNR),
-corrupt test audio and evaluate. Output: degradation curves for analysis.
+Pipeline:
+1. Create noisy dataset (data/noisy/{noise_type}_{snr}dB/) — same split as Stage 4-7
+2. Train base transformers (HuBERT, WavLM) on each noisy condition
+3. Train fusion models (HuBERT+acoustic, WavLM+acoustic) on each noisy condition
+4. Evaluate all models; compare clean vs noisy; base vs fusion
+5. Generate plots and analysis
 
-- hubert_base_ls960 (etc.): fine-tuned transformer from checkpoint (encoder + trained head).
-- hubert_frozen_lr: frozen HuBERT encoder + LR on embeddings only — same pipeline as notebook 07
-  "HuBERT Embeddings Only", for fair comparison with Fusion.
-- Fusion: frozen HuBERT embeddings + acoustic features + LR (trained on clean, evaluated on noisy).
-
-Noise types: white (flat spectrum), pink (1/f), compression (codec-like simulation).
-SNR levels: clean (inf), 20, 10, 5, 0 dB.
+Output: results/noise_robustness.json, reports/noise_robustness_*.png
 """
 
 import json
@@ -20,50 +18,54 @@ from pathlib import Path
 
 import joblib
 import librosa
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
-from scipy import signal
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import roc_auc_score
+import torch.nn as nn
+from datasets import Dataset
+from tqdm.auto import tqdm
+from transformers import (
+    AutoFeatureExtractor,
+    AutoModelForAudioClassification,
+    Trainer,
+    TrainingArguments,
+    get_linear_schedule_with_warmup,
+)
 from sklearn.preprocessing import StandardScaler
-from transformers import AutoFeatureExtractor, AutoModelForAudioClassification
+from torch.utils.data import DataLoader
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from config import (
-    F0_FMAX,
-    F0_FMIN,
-    HOP_LENGTH,
-    N_FFT,
-    N_MELS,
+    BATCH_SIZE,
+    FEATURES_DIR,
+    LEARNING_RATE,
+    MAX_EPOCHS,
+    NOISY_DATA_DIR,
     NOISE_TYPES,
     OUTPUTS_DIR,
-    PROCESSED_DIR,
     RANDOM_SEED,
+    RESULTS_DIR,
     SAMPLE_RATE,
     SNR_LEVELS_DB,
-    TEST_SIZE,
-    TRANSFORMER_MODELS,
-    VAL_SIZE,
+    SNR_LEVELS_NOISY,
 )
-from src.features.acoustic_scipy import extract_all_features, features_to_vector, get_feature_names
-from src.models.cnn_spectrogram import SpectrogramCNN
-from src.utils.audio import load_audio
+from scripts.extract_features import extract_features_from_dir
+from src.models.transformer_fusion import TransformerFusionModel
+from src.utils.dataset_fusion import FusionDataset
 from src.utils.eval import evaluate_binary
-from src.utils.paths import get_audio_paths_with_labels
-from src.utils.splits import speaker_disjoint_split
+from src.utils.noise_utils import create_noisy_dataset, get_noisy_subdir_name
+from src.utils.splits import load_split, SPLIT_FILENAME
 
-MAX_AUDIO_SAMPLES = int(5.0 * SAMPLE_RATE)
-BEST_TRANSFORMER = "facebook/hubert-base-ls960"
-FUSION_TOP_ACOUSTIC_N = 30
-FUSION_CORR_THRESHOLD = 0.85
-LR_C = 0.1
+REPORTS_DIR = PROJECT_ROOT / "reports"
+
+# Models to compare: 2 best base + 2 fusion (HuBERT, WavLM)
+BASE_MODELS = ["facebook/hubert-base-ls960", "microsoft/wavlm-base"]
 
 
 def model_short_name(model_id: str) -> str:
-    """Match train_transformers naming exactly for checkpoint dirs."""
     name = model_id.split("/")[-1].split(".")[0]
     for suffix in ["-base", "-tiny", "-small", "_base", "_tiny", "_small"]:
         if name.endswith(suffix):
@@ -72,413 +74,640 @@ def model_short_name(model_id: str) -> str:
     return name.replace("-", "_")
 
 
-def _get_encoder(model):
-    """Get encoder submodule (hubert, wav2vec2, wavlm)."""
-    for attr in ("hubert", "wav2vec2", "wavlm"):
-        enc = getattr(model, attr, None)
-        if enc is not None:
-            return enc
-    raise ValueError("Unknown model type: no encoder found")
+def ensure_noisy_datasets(tr_pairs, val_pairs, test_pairs) -> dict:
+    """Create noisy datasets if not present. Return metadata for each condition."""
+    NOISY_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    metadata_dir = NOISY_DATA_DIR / "metadata"
+    all_meta = {}
+
+    for noise_type in NOISE_TYPES:
+        for snr_db in SNR_LEVELS_NOISY:
+            key = get_noisy_subdir_name(noise_type, snr_db)
+            meta_path = metadata_dir / f"{key}.json"
+
+            if meta_path.exists():
+                with open(meta_path) as f:
+                    all_meta[key] = json.load(f)
+                continue
+
+            root, meta = create_noisy_dataset(
+                tr_pairs, val_pairs, test_pairs,
+                noise_type, snr_db, NOISY_DATA_DIR, SAMPLE_RATE, RANDOM_SEED,
+            )
+            metadata_dir.mkdir(exist_ok=True)
+            data = {"root": str(root), "metadata": meta}
+            with open(meta_path, "w") as f:
+                json.dump(data, f, indent=2)
+            all_meta[key] = data
+
+    return all_meta
 
 
-def extract_embeddings_from_arrays(model, feature_extractor, arrays, device, batch_size=16):
-    """Extract mean-pooled embeddings from audio arrays."""
-    model.eval()
-    encoder = _get_encoder(model)
-    embeddings = []
-    for i in range(0, len(arrays), batch_size):
-        batch = arrays[i : i + batch_size]
-        batch = [a.astype(np.float32) for a in batch]
-        inputs = feature_extractor(
-            batch, sampling_rate=SAMPLE_RATE, return_tensors="pt",
-            padding=True, truncation=True, max_length=MAX_AUDIO_SAMPLES,
-        )
-        inputs = {k: v.to(device) for k, v in inputs.items()}
-        with torch.no_grad():
-            out = encoder(**inputs)
-            hidden = out.last_hidden_state
-            mask = inputs.get("attention_mask")
-            if mask is not None:
-                mask = mask.unsqueeze(-1).float()
-                pooled = (hidden * mask).sum(1) / mask.sum(1).clamp(min=1e-9)
-            else:
-                pooled = hidden.mean(1)
-        embeddings.append(pooled.cpu().numpy())
-    return np.vstack(embeddings)
+def pairs_from_metadata(meta: dict, orig_pairs: list, split: str) -> list:
+    """Build (path, label) pairs for noisy data from metadata.
+    Metadata order matches orig_pairs (created in same order).
+    """
+    noisy_list = meta["metadata"][split]  # [(orig_path, noisy_path), ...]
+    return [(Path(noisy_path), label) for (_, noisy_path), (_, label) in zip(noisy_list, orig_pairs)]
 
 
-def select_acoustic_features(X: np.ndarray, y: np.ndarray, top_n: int = FUSION_TOP_ACOUSTIC_N, corr_threshold: float = FUSION_CORR_THRESHOLD) -> np.ndarray:
-    """Select acoustic features: top by univariate AUC, then remove highly correlated."""
-    n_feats = X.shape[1]
-    aucs = []
-    for j in range(n_feats):
-        col = X[:, j]
-        if np.std(col) < 1e-9 or np.any(np.isnan(col)):
-            aucs.append(0.5)
-            continue
-        auc = roc_auc_score(y, col)
-        aucs.append(max(auc, 1 - auc))
-    aucs = np.array(aucs)
-    top_idx = np.argsort(aucs)[::-1][:top_n]
-    X_top = X[:, top_idx]
-    corr = np.corrcoef(X_top.T)
-    np.fill_diagonal(corr, 0)
-    keep = []
-    for i in range(len(top_idx)):
-        if all(np.abs(corr[i, j]) < corr_threshold for j in keep):
-            keep.append(i)
-    return top_idx[keep]
+def train_base_transformer(
+    model_id: str,
+    train_paths: list,
+    train_labels: list,
+    val_paths: list,
+    val_labels: list,
+    out_dir: Path,
+    device,
+) -> dict:
+    """Train base transformer on given paths. Returns best threshold and val metrics."""
+    short = model_short_name(model_id)
+    max_samples = int(5.0 * SAMPLE_RATE)
 
-
-def add_white_noise(y: np.ndarray, snr_db: float, rng: np.random.Generator) -> np.ndarray:
-    """Add white Gaussian noise to achieve target SNR (dB)."""
-    if snr_db == float("inf"):
-        return y.copy()
-    sig_power = np.mean(y ** 2)
-    noise_power = sig_power / (10 ** (snr_db / 10))
-    noise = rng.standard_normal(len(y), dtype=np.float32) * np.sqrt(noise_power)
-    return y + noise
-
-
-def add_pink_noise(y: np.ndarray, snr_db: float, rng: np.random.Generator) -> np.ndarray:
-    """Add pink (1/f) noise. Generate via filtering white noise."""
-    if snr_db == float("inf"):
-        return y.copy()
-    white = rng.standard_normal(len(y), dtype=np.float32)
-    # Approximate 1/f: integrate white -> brown, average with white for pink
-    b = [0.049922035, -0.095993537, 0.050612699, -0.004408786]
-    a = [1, -2.494956002, 2.017265875, -0.522189400]
-    pink = signal.lfilter(b, a, white)
-    pink = pink / (np.std(pink) + 1e-8)
-    sig_power = np.mean(y ** 2)
-    noise_power = sig_power / (10 ** (snr_db / 10))
-    return y + pink * np.sqrt(noise_power)
-
-
-def add_compression_noise(y: np.ndarray, snr_db: float, sr: int, rng: np.random.Generator) -> np.ndarray:
-    """Simulate codec artifacts: bandwidth limit + quantization. SNR controls noise level."""
-    if snr_db == float("inf"):
-        return y.copy()
-    # Downsample to 8kHz and back (telephony-like)
-    y_8k = librosa.resample(y.astype(np.float64), orig_sr=sr, target_sr=8000)
-    y_back = librosa.resample(y_8k, orig_sr=8000, target_sr=sr)
-    if len(y_back) > len(y):
-        y_back = y_back[: len(y)]
-    elif len(y_back) < len(y):
-        y_back = np.pad(y_back, (0, len(y) - len(y_back)), mode="edge")
-    # Add quantization-like noise
-    n_bits = max(4, int(16 - (0 - snr_db) / 6))
-    scale = 2 ** (n_bits - 1)
-    quantized = np.round(y_back * scale) / scale
-    # Blend with original based on SNR
-    alpha = 1.0 / (1.0 + 10 ** (-snr_db / 10))
-    return (1 - alpha) * y + alpha * quantized
-
-
-def corrupt_audio(y: np.ndarray, noise_type: str, snr_db: float, sr: int, rng: np.random.Generator) -> np.ndarray:
-    if noise_type == "white":
-        return add_white_noise(y, snr_db, rng)
-    if noise_type == "pink":
-        return add_pink_noise(y, snr_db, rng)
-    if noise_type == "compression":
-        return add_compression_noise(y, snr_db, sr, rng)
-    return y.copy()
-
-
-def evaluate_transformers(test_paths, test_labels, noise_type, snr_db, model, feature_extractor, device, rng, max_samples=None):
-    """Run transformer on corrupted audio."""
-    model.eval()
-    preds, probs = [], []
-    max_samples = max_samples or MAX_AUDIO_SAMPLES
-    for i in range(0, len(test_paths), 16):
-        batch_paths = test_paths[i : i + 16]
+    def load_audio_batch(paths):
         arrays = []
-        for p in batch_paths:
-            y = load_audio(p, sr=SAMPLE_RATE)
-            y = corrupt_audio(y.astype(np.float32), noise_type, snr_db, SAMPLE_RATE, rng)
+        for p in paths:
+            y, _ = librosa.load(str(p), sr=SAMPLE_RATE, mono=True)
             if len(y) > max_samples:
                 start = (len(y) - max_samples) // 2
                 y = y[start : start + max_samples]
             elif len(y) < max_samples:
                 y = np.pad(y, (0, max_samples - len(y)), mode="constant")
-            arrays.append(y)
-        inputs = feature_extractor(
+            arrays.append(y.astype(np.float32))
+        return arrays
+
+    train_ds = Dataset.from_dict({"path": train_paths, "label": train_labels})
+    val_ds = Dataset.from_dict({"path": val_paths, "label": val_labels})
+
+    fe = AutoFeatureExtractor.from_pretrained(model_id)
+    max_length = int(5.0 * getattr(fe, "sampling_rate", SAMPLE_RATE))
+
+    def preprocess(examples):
+        arrays = load_audio_batch(examples["path"])
+        return fe(
+            arrays,
+            sampling_rate=getattr(fe, "sampling_rate", SAMPLE_RATE),
+            max_length=max_length,
+            truncation=True,
+            padding="max_length",
+        )
+
+    enc_train = train_ds.map(preprocess, remove_columns="path", batched=True, desc="Preprocess")
+    enc_val = val_ds.map(preprocess, remove_columns="path", batched=True, desc="Preprocess")
+
+    model = AutoModelForAudioClassification.from_pretrained(
+        model_id, num_labels=2, label2id={"real": 0, "fake": 1}, id2label={0: "real", 1: "fake"}
+    )
+
+    trainer = Trainer(
+        model=model,
+        args=TrainingArguments(
+            output_dir=str(out_dir),
+            eval_strategy="epoch",
+            save_strategy="epoch",
+            learning_rate=LEARNING_RATE,
+            per_device_train_batch_size=8,
+            per_device_eval_batch_size=16,
+            num_train_epochs=5,
+            warmup_ratio=0.1,
+            logging_steps=20,
+            load_best_model_at_end=True,
+            metric_for_best_model="accuracy",
+            save_total_limit=1,
+            seed=RANDOM_SEED,
+        ),
+        train_dataset=enc_train,
+        eval_dataset=enc_val,
+        processing_class=fe,
+        compute_metrics=lambda p: {
+            "accuracy": float(np.mean(np.argmax(p.predictions, 1) == p.label_ids)),
+            "f1": float(
+                evaluate_binary(
+                    p.label_ids,
+                    np.argmax(p.predictions, 1),
+                    (np.exp(p.predictions) / np.exp(p.predictions).sum(1, keepdims=True))[:, 1],
+                )["f1"]
+            ),
+        },
+    )
+
+    trainer.train()
+    trainer.save_model(str(out_dir))
+
+    pred_val = trainer.predict(enc_val)
+    prob_val = np.exp(pred_val.predictions) / np.exp(pred_val.predictions).sum(1, keepdims=True)
+    prob_val = prob_val[:, 1]
+    y_val = pred_val.label_ids
+
+    best_t = 0.5
+    best_f1 = -1.0
+    for t in np.linspace(0.05, 0.95, 19):
+        y_pred = (prob_val >= t).astype(np.int64)
+        m = evaluate_binary(y_val, y_pred, prob_val)
+        if m["f1"] >= best_f1:
+            best_f1 = m["f1"]
+            best_t = float(t)
+
+    # Save threshold for evaluation
+    with open(out_dir / "results.json", "w") as f:
+        json.dump({"decision_threshold": best_t}, f)
+    return {"threshold": best_t, "val_metrics": evaluate_binary(y_val, (prob_val >= best_t).astype(np.int64), prob_val)}
+
+
+def train_fusion(
+    model_id: str,
+    tr_pairs: list,
+    val_pairs: list,
+    test_pairs: list,
+    acoustic_csv: Path,
+    ckpt_dir: Path,
+    device,
+) -> dict:
+    """Train fusion model. Acoustic features from noisy csv; scaler fit on noisy train only."""
+    short = model_short_name(model_id)
+    df = pd.read_csv(acoustic_csv)
+    if df.empty:
+        raise RuntimeError(f"Empty acoustic CSV: {acoustic_csv}")
+
+    path_to_idx = {}
+    for idx, row in df.iterrows():
+        p = Path(row["path"]).resolve()
+        path_to_idx[str(p)] = idx
+        path_to_idx[p.as_posix()] = idx
+
+    feat_cols = [c for c in df.columns if c not in ("path", "label")]
+    acoustic_dim = len(feat_cols)
+
+    def subset(pairs):
+        xs, ys = [], []
+        for p, l in pairs:
+            key = str(Path(p).resolve())
+            if key not in path_to_idx and Path(p).resolve().as_posix() not in path_to_idx:
+                continue
+            xs.append(p)
+            ys.append(l)
+        return xs, ys
+
+    tr_paths, tr_labels = subset(tr_pairs)
+    val_paths, val_labels = subset(val_pairs)
+    te_paths, te_labels = subset(test_pairs)
+
+    def matrix(paths):
+        rows = []
+        for p in paths:
+            key = str(Path(p).resolve())
+            if key not in path_to_idx:
+                key = Path(p).resolve().as_posix()
+            idx = path_to_idx[key]
+            rows.append(df.iloc[idx][feat_cols].values.astype(np.float64))
+        return np.array(rows)
+
+    X_tr = matrix(tr_paths)
+    X_val = matrix(val_paths)
+    X_te = matrix(te_paths)
+    train_median = np.nanmedian(X_tr, axis=0)
+    X_tr = np.nan_to_num(X_tr, nan=train_median)
+    X_val = np.nan_to_num(X_val, nan=train_median)
+    X_te = np.nan_to_num(X_te, nan=train_median)
+    scaler = StandardScaler().fit(X_tr)
+
+    fe = AutoFeatureExtractor.from_pretrained(model_id)
+
+    train_ds = FusionDataset(tr_paths, tr_labels, df, scaler, feat_cols, fe)
+    val_ds = FusionDataset(val_paths, val_labels, df, scaler, feat_cols, fe)
+    test_ds = FusionDataset(te_paths, te_labels, df, scaler, feat_cols, fe)
+
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
+    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+    test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+
+    model = TransformerFusionModel(model_id, acoustic_dim=acoustic_dim).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
+    criterion = nn.CrossEntropyLoss()
+    num_steps = MAX_EPOCHS * len(train_loader)
+    scheduler = get_linear_schedule_with_warmup(optimizer, int(0.1 * num_steps), num_steps)
+
+    best_val_auc = 0.0
+    patience_counter = 0
+    ckpt_path = ckpt_dir / f"fusion_{short}.pt"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    for epoch in range(1, MAX_EPOCHS + 1):
+        model.train()
+        for batch in tqdm(train_loader, desc=f"{short} epoch {epoch}", leave=False):
+            optimizer.zero_grad()
+            logits = model(
+                input_values=batch["input_values"].to(device),
+                attention_mask=batch["attention_mask"].to(device),
+                acoustic=batch["acoustic"].to(device),
+            )
+            loss = criterion(logits, batch["labels"].to(device))
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
+
+        model.eval()
+        all_prob, all_y = [], []
+        with torch.no_grad():
+            for batch in val_loader:
+                logits = model(
+                    input_values=batch["input_values"].to(device),
+                    attention_mask=batch["attention_mask"].to(device),
+                    acoustic=batch["acoustic"].to(device),
+                )
+                prob = torch.softmax(logits, dim=1)[:, 1].cpu().numpy()
+                all_prob.extend(prob)
+                all_y.extend(batch["labels"].numpy())
+        all_prob = np.array(all_prob)
+        all_y = np.array(all_y)
+        val_metrics = evaluate_binary(all_y, (all_prob >= 0.5).astype(np.int64), all_prob)
+        val_auc = val_metrics["auc_roc"]
+
+        if val_auc > best_val_auc + 1e-4:
+            best_val_auc = val_auc
+            patience_counter = 0
+            torch.save(model.state_dict(), ckpt_path)
+        else:
+            patience_counter += 1
+        if patience_counter >= 5:
+            break
+
+    model.load_state_dict(torch.load(ckpt_path, map_location=device, weights_only=True))
+    model.eval()
+
+    def collect_probs(loader):
+        probs, labels = [], []
+        with torch.no_grad():
+            for batch in loader:
+                logits = model(
+                    input_values=batch["input_values"].to(device),
+                    attention_mask=batch["attention_mask"].to(device),
+                    acoustic=batch["acoustic"].to(device),
+                )
+                p = torch.softmax(logits, dim=1)[:, 1].cpu().numpy()
+                probs.extend(p)
+                labels.extend(batch["labels"].numpy())
+        return np.array(probs), np.array(labels)
+
+    prob_val, y_val = collect_probs(val_loader)
+    best_t = 0.5
+    best_f1 = -1.0
+    for t in np.linspace(0.05, 0.95, 19):
+        y_pred = (prob_val >= t).astype(np.int64)
+        m = evaluate_binary(y_val, y_pred, prob_val)
+        if m["f1"] >= best_f1:
+            best_f1 = m["f1"]
+            best_t = float(t)
+
+    prob_te, y_te = collect_probs(test_loader)
+    test_metrics = evaluate_binary(y_te, (prob_te >= best_t).astype(np.int64), prob_te)
+    test_metrics["decision_threshold"] = best_t
+
+    # Save scaler and threshold for evaluation (shared across models in same condition)
+    joblib.dump(scaler, ckpt_dir / "scaler.joblib")
+    with open(ckpt_dir / f"threshold_{short}.json", "w") as f:
+        json.dump({"threshold": best_t}, f)
+    return test_metrics
+
+
+def evaluate_base_transformer(
+    model_dir: Path,
+    test_paths: list,
+    test_labels: list,
+    device,
+) -> dict:
+    """Evaluate fine-tuned base transformer on test set."""
+    model = AutoModelForAudioClassification.from_pretrained(str(model_dir))
+    fe = AutoFeatureExtractor.from_pretrained(str(model_dir))
+    model = model.to(device).eval()
+
+    max_samples = int(5.0 * SAMPLE_RATE)
+    probs = []
+    for i in range(0, len(test_paths), 16):
+        batch_paths = test_paths[i : i + 16]
+        arrays = []
+        for p in batch_paths:
+            y, _ = librosa.load(str(p), sr=SAMPLE_RATE, mono=True)
+            if len(y) > max_samples:
+                start = (len(y) - max_samples) // 2
+                y = y[start : start + max_samples]
+            elif len(y) < max_samples:
+                y = np.pad(y, (0, max_samples - len(y)), mode="constant")
+            arrays.append(y.astype(np.float32))
+        inputs = fe(
             arrays, sampling_rate=SAMPLE_RATE, return_tensors="pt",
             padding=True, truncation=True, max_length=max_samples,
         )
         inputs = {k: v.to(device) for k, v in inputs.items()}
         with torch.no_grad():
-            out = model(**inputs)
-            logits = out.logits
+            logits = model(**inputs).logits
         probs.extend(torch.softmax(logits, dim=1)[:, 1].cpu().numpy())
-        preds.extend(torch.argmax(logits, dim=1).cpu().numpy())
-    return evaluate_binary(np.array(test_labels), np.array(preds), np.array(probs))
+
+    probs = np.array(probs)
+    # Load threshold from results.json if present
+    res_file = model_dir / "results.json"
+    thresh = 0.5
+    if res_file.exists():
+        try:
+            with open(res_file) as f:
+                thresh = json.load(f).get("decision_threshold", 0.5)
+        except Exception:
+            pass
+    preds = (probs >= thresh).astype(np.int64)
+    return evaluate_binary(np.array(test_labels), preds, probs)
 
 
-def evaluate_cnn(test_paths, test_labels, noise_type, snr_db, model, device, rng):
-    """Run CNN on mel-spectrogram from corrupted audio."""
+def evaluate_fusion_model(
+    model_id: str,
+    ckpt_path: Path,
+    test_pairs: list,
+    acoustic_csv: Path,
+    device,
+) -> dict:
+    """Evaluate fusion model on test set. Threshold from validation (stored in training)."""
+    short = model_short_name(model_id)
+    df = pd.read_csv(acoustic_csv)
+    feat_cols = [c for c in df.columns if c not in ("path", "label")]
+
+    scaler_path = ckpt_path.parent / "scaler.joblib"
+    if not scaler_path.exists():
+        return {"accuracy": 0, "precision": 0, "recall": 0, "f1": 0, "auc_roc": 0, "confusion_matrix": [[0, 0], [0, 0]]}
+    scaler = joblib.load(scaler_path)
+
+    test_paths = [p for p, _ in test_pairs]
+    test_labels = [l for _, l in test_pairs]
+    test_ds = FusionDataset(test_paths, test_labels, df, scaler, feat_cols,
+                           AutoFeatureExtractor.from_pretrained(model_id))
+    loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+
+    model = TransformerFusionModel(model_id, acoustic_dim=len(feat_cols)).to(device)
+    model.load_state_dict(torch.load(ckpt_path, map_location=device, weights_only=True))
     model.eval()
-    preds, probs = [], []
-    max_frames = int(5.0 * SAMPLE_RATE / HOP_LENGTH)
-    for p, lb in zip(test_paths, test_labels):
-        y = load_audio(p, sr=SAMPLE_RATE)
-        y = corrupt_audio(y.astype(np.float32), noise_type, snr_db, SAMPLE_RATE, rng)
-        mel = librosa.feature.melspectrogram(
-            y=y, sr=SAMPLE_RATE, n_mels=N_MELS, n_fft=N_FFT, hop_length=HOP_LENGTH
-        )
-        mel_db = librosa.power_to_db(mel, ref=np.max)
-        mel_db = (mel_db - mel_db.mean()) / (mel_db.std() + 1e-8)
-        T = mel_db.shape[1]
-        if T > max_frames:
-            start = (T - max_frames) // 2
-            mel_db = mel_db[:, start : start + max_frames]
-        elif T < max_frames:
-            mel_db = np.pad(mel_db, ((0, 0), (0, max_frames - T)), mode="constant")
-        x = torch.from_numpy(mel_db).float().unsqueeze(0).unsqueeze(0).to(device)
-        with torch.no_grad():
-            logits = model(x)
-        probs.append(torch.softmax(logits, dim=1)[0, 1].item())
-        preds.append(torch.argmax(logits, dim=1)[0].item())
-    return evaluate_binary(np.array(test_labels), np.array(preds), np.array(probs))
 
+    probs, labels = [], []
+    with torch.no_grad():
+        for batch in loader:
+            logits = model(
+                input_values=batch["input_values"].to(device),
+                attention_mask=batch["attention_mask"].to(device),
+                acoustic=batch["acoustic"].to(device),
+            )
+            probs.extend(torch.softmax(logits, dim=1)[:, 1].cpu().numpy())
+            labels.extend(batch["labels"].numpy())
 
-def evaluate_rf(test_paths, test_labels, noise_type, snr_db, pipe, rng):
-    """Extract features from corrupted audio, run RF."""
-    feat_names = get_feature_names()
-    X = []
-    for p in test_paths:
-        y = load_audio(p, sr=SAMPLE_RATE)
-        y = corrupt_audio(y.astype(np.float32), noise_type, snr_db, SAMPLE_RATE, rng)
-        feat = extract_all_features(
-            y, sr=SAMPLE_RATE, n_mfcc=13, n_mels=N_MELS, hop_length=HOP_LENGTH,
-            n_fft=N_FFT, f0_fmin=F0_FMIN, f0_fmax=F0_FMAX,
-        )
-        vec = features_to_vector(feat)
-        X.append(vec)
-    X = np.array(X)
-    df = pd.DataFrame(X, columns=feat_names)
-    df = df.fillna(df.median())
-    pred = pipe.predict(df)
-    prob = pipe.predict_proba(df)[:, 1]
-    return evaluate_binary(np.array(test_labels), pred, prob)
-
-
-def evaluate_frozen_hubert_lr(test_paths, test_labels, noise_type, snr_db, state, device, rng):
-    """Run frozen HuBERT encoder + LR (no acoustic). Same pipeline as 07 'HuBERT Embeddings Only'."""
-    scaler, lr, model, feature_extractor = (
-        state["scaler"], state["lr"], state["model"], state["feature_extractor"],
-    )
-    arrays = []
-    for p in test_paths:
-        y = load_audio(p, sr=SAMPLE_RATE)
-        y = corrupt_audio(y.astype(np.float32), noise_type, snr_db, SAMPLE_RATE, rng)
-        if len(y) > MAX_AUDIO_SAMPLES:
-            start = (len(y) - MAX_AUDIO_SAMPLES) // 2
-            y = y[start : start + MAX_AUDIO_SAMPLES]
-        elif len(y) < MAX_AUDIO_SAMPLES:
-            y = np.pad(y, (0, MAX_AUDIO_SAMPLES - len(y)), mode="constant")
-        arrays.append(y)
-    emb = extract_embeddings_from_arrays(model, feature_extractor, arrays, device)
-    X_s = scaler.transform(emb)
-    pred = lr.predict(X_s)
-    prob = lr.predict_proba(X_s)[:, 1]
-    return evaluate_binary(np.array(test_labels), pred, prob)
-
-
-def evaluate_fusion(test_paths, test_labels, noise_type, snr_db, fusion_state, device, rng):
-    """Run fusion (HuBERT emb + acoustic) on corrupted audio."""
-    scaler, lr, sel_idx, model, feature_extractor = (
-        fusion_state["scaler"], fusion_state["lr"], fusion_state["sel_idx"],
-        fusion_state["model"], fusion_state["feature_extractor"],
-    )
-    arrays = []
-    X_ac = []
-    for p in test_paths:
-        y = load_audio(p, sr=SAMPLE_RATE)
-        y = corrupt_audio(y.astype(np.float32), noise_type, snr_db, SAMPLE_RATE, rng)
-        if len(y) > MAX_AUDIO_SAMPLES:
-            start = (len(y) - MAX_AUDIO_SAMPLES) // 2
-            y = y[start : start + MAX_AUDIO_SAMPLES]
-        elif len(y) < MAX_AUDIO_SAMPLES:
-            y = np.pad(y, (0, MAX_AUDIO_SAMPLES - len(y)), mode="constant")
-        arrays.append(y)
-        feat = extract_all_features(
-            y, sr=SAMPLE_RATE, n_mfcc=13, n_mels=N_MELS, hop_length=HOP_LENGTH,
-            n_fft=N_FFT, f0_fmin=F0_FMIN, f0_fmax=F0_FMAX,
-        )
-        vec = features_to_vector(feat)
-        X_ac.append(vec)
-    X_ac = np.array(X_ac)
-    X_ac = np.nan_to_num(X_ac, nan=np.nanmedian(X_ac, axis=0))
-    X_ac = X_ac[:, sel_idx]
-    emb = extract_embeddings_from_arrays(model, feature_extractor, arrays, device)
-    X = np.hstack([emb, X_ac])
-    X_s = scaler.transform(X)
-    pred = lr.predict(X_s)
-    prob = lr.predict_proba(X_s)[:, 1]
-    return evaluate_binary(np.array(test_labels), pred, prob)
+    probs = np.array(probs)
+    labels = np.array(labels)
+    thresh_path = ckpt_path.parent / f"threshold_{short}.json"
+    thresh = 0.5
+    if thresh_path.exists():
+        try:
+            thresh = json.load(open(thresh_path)).get("threshold", 0.5)
+        except Exception:
+            pass
+    preds = (probs >= thresh).astype(np.int64)
+    return evaluate_binary(labels, preds, probs)
 
 
 def main() -> int:
-    OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
     np.random.seed(RANDOM_SEED)
     torch.manual_seed(RANDOM_SEED)
-    rng = np.random.default_rng(RANDOM_SEED)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(
+        "cuda" if torch.cuda.is_available()
+        else "mps" if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available()
+        else "cpu"
+    )
+    print(f"Device: {device}")
 
-    pairs = get_audio_paths_with_labels(PROCESSED_DIR)
-    if not pairs:
-        print("No processed audio. Run: python scripts/run_preprocessing.py")
+    split_path = RESULTS_DIR / SPLIT_FILENAME
+    loaded = load_split(split_path)
+    if loaded is None:
+        print("results/split.json missing. Run: python scripts/train_cnn.py first.")
         return 1
 
-    val_ratio = VAL_SIZE / (1 - TEST_SIZE)
-    tr_pairs, _, test_pairs = speaker_disjoint_split(pairs, TEST_SIZE, val_ratio, RANDOM_SEED)
-    train_paths = [p for p, _ in tr_pairs]
-    train_labels = np.array([l for _, l in tr_pairs])
-    test_paths = [p for p, _ in test_pairs]
-    test_labels = [l for _, l in test_pairs]
-    print(f"Train set: {len(train_paths)}, Test set: {len(test_paths)} samples")
+    tr_pairs, val_pairs, test_pairs = loaded
+    print(f"Split: train={len(tr_pairs)}, val={len(val_pairs)}, test={len(test_pairs)}")
 
-    results = {}
+    # --- Part 1: Create noisy datasets ---
+    print("\n=== Part 1: Noisy datasets ===")
+    all_meta = ensure_noisy_datasets(tr_pairs, val_pairs, test_pairs)
 
-    # 1. Transformers (all with checkpoints: HuBERT, Wav2Vec2, WavLM, Whisper)
-    for model_id in TRANSFORMER_MODELS:
-        short = model_short_name(model_id)
-        ckpt_dir = OUTPUTS_DIR / f"transformer_{short}"
-        if not ckpt_dir.exists():
-            print(f"Skipping {short} (no checkpoint at {ckpt_dir})")
-            continue
-        print(f"\nEvaluating {short}...")
-        model = AutoModelForAudioClassification.from_pretrained(str(ckpt_dir))
-        feature_extractor = AutoFeatureExtractor.from_pretrained(str(ckpt_dir))
-        model = model.to(device)
-        # Whisper expects 30s; others use 5s
-        max_samples = int(30 * SAMPLE_RATE) if "whisper" in model_id.lower() else MAX_AUDIO_SAMPLES
-        results[short] = {}
-        for noise_type in NOISE_TYPES:
-            results[short][noise_type] = {}
-            for snr in SNR_LEVELS_DB:
-                label = "clean" if snr == float("inf") else f"{int(snr)}dB"
-                m = evaluate_transformers(
-                    test_paths, test_labels, noise_type, snr,
-                    model, feature_extractor, device, rng, max_samples=max_samples
+    # --- Part 2: Extract acoustic features for each noisy condition ---
+    FEATURES_DIR.mkdir(parents=True, exist_ok=True)
+    for key in all_meta:
+        csv_path = FEATURES_DIR / f"acoustic_noisy_{key}.csv"
+        if not csv_path.exists():
+            root = Path(all_meta[key]["root"])
+            extract_features_from_dir(root, csv_path)
+
+    # --- Part 3 & 4: Train and evaluate ---
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Load clean baseline from Stage 6 and Stage 7 results (no re-eval to avoid scaler issues)
+    clean_base = {}
+    clean_fusion = {}
+    tr_results = OUTPUTS_DIR / "transformer_results.json"
+    fusion_results = OUTPUTS_DIR / "fusion_models_results.json"
+    for short in ["hubert_base_ls960", "wavlm"]:
+        clean_base[short] = None
+        clean_fusion[short] = None
+    if tr_results.exists():
+        with open(tr_results) as f:
+            tr_data = json.load(f)
+        for short in ["hubert_base_ls960", "wavlm"]:
+            if short in tr_data:
+                m = tr_data[short]
+                clean_base[short] = {k: v for k, v in m.items() if k in ("accuracy", "precision", "recall", "f1", "auc_roc")}
+    if fusion_results.exists():
+        with open(fusion_results) as f:
+            fusion_data = json.load(f)
+        for short in ["hubert_base_ls960", "wavlm"]:
+            if short in fusion_data:
+                m = fusion_data[short]
+                clean_fusion[short] = {k: v for k, v in m.items() if k in ("accuracy", "precision", "recall", "f1", "auc_roc")}
+
+    # Results structure: {model: {condition: metrics}}
+    results = {
+        "clean": {"base": clean_base, "fusion": clean_fusion},
+        "noisy": {},
+        "thresholds": {},
+    }
+
+    for key in sorted(all_meta.keys()):
+        print(f"\n=== Condition: {key} ===")
+        meta = all_meta[key]
+        root = Path(meta["root"])
+        csv_path = FEATURES_DIR / f"acoustic_noisy_{key}.csv"
+
+        tr_noisy = pairs_from_metadata(meta, tr_pairs, "train")
+        val_noisy = pairs_from_metadata(meta, val_pairs, "val")
+        te_noisy = pairs_from_metadata(meta, test_pairs, "test")
+
+        tr_paths = [str(p) for p, _ in tr_noisy]
+        tr_labels = [l for _, l in tr_noisy]
+        val_paths = [str(p) for p, _ in val_noisy]
+        val_labels = [l for _, l in val_noisy]
+        te_paths = [str(p) for p, _ in te_noisy]
+        te_labels = [l for _, l in te_noisy]
+
+        results["noisy"][key] = {"base": {}, "fusion": {}}
+
+        # Train base transformers
+        for model_id in BASE_MODELS:
+            short = model_short_name(model_id)
+            out_dir = OUTPUTS_DIR / "noisy" / key / f"transformer_{short}"
+            if not (out_dir / "config.json").exists():
+                print(f"  Training base {short}...")
+                train_base_transformer(
+                    model_id, tr_paths, tr_labels, val_paths, val_labels, out_dir, device
                 )
-                results[short][noise_type][label] = {"auc": m["auc_roc"], "f1": m["f1"]}
-                print(f"  {noise_type} {label}: AUC={m['auc_roc']:.3f}")
-    if not any(r.startswith("hubert") or r.startswith("wav2vec") or r.startswith("wavlm") or r.startswith("whisper") for r in results):
-        print("No transformer checkpoints found. Run: python scripts/train_transformers.py")
+            else:
+                print(f"  Base {short} already trained")
 
-    # 2. CNN
-    cnn_path = OUTPUTS_DIR / "cnn_spectrogram.pt"
-    if cnn_path.exists():
-        print("\nEvaluating CNN...")
-        model = SpectrogramCNN(n_mels=N_MELS, n_classes=2)
-        model.load_state_dict(torch.load(cnn_path, map_location=device, weights_only=True))
-        model = model.to(device)
-        model.eval()
-        results["cnn"] = {}
-        for noise_type in NOISE_TYPES:
-            results["cnn"][noise_type] = {}
-            for snr in SNR_LEVELS_DB:
-                label = "clean" if snr == float("inf") else f"{int(snr)}dB"
-                m = evaluate_cnn(test_paths, test_labels, noise_type, snr, model, device, rng)
-                results["cnn"][noise_type][label] = {"auc": m["auc_roc"], "f1": m["f1"]}
-                print(f"  {noise_type} {label}: AUC={m['auc_roc']:.3f}")
-    else:
-        print("No CNN checkpoint. Run: python scripts/train_cnn.py")
+            metrics = evaluate_base_transformer(out_dir, te_paths, te_labels, device)
+            results["noisy"][key]["base"][short] = metrics
 
-    # 3. RF (acoustic baseline)
-    rf_path = OUTPUTS_DIR / "baseline_random_forest.joblib"
-    if rf_path.exists():
-        print("\nEvaluating RF...")
-        pipe = joblib.load(rf_path)
-        results["rf"] = {}
-        for noise_type in NOISE_TYPES:
-            results["rf"][noise_type] = {}
-            for snr in SNR_LEVELS_DB:
-                label = "clean" if snr == float("inf") else f"{int(snr)}dB"
-                m = evaluate_rf(test_paths, test_labels, noise_type, snr, pipe, rng)
-                results["rf"][noise_type][label] = {"auc": m["auc_roc"], "f1": m["f1"]}
-                print(f"  {noise_type} {label}: AUC={m['auc_roc']:.3f}")
-    else:
-        print("No RF checkpoint. Run: python scripts/train_baseline.py")
+        # Train fusion models
+        for model_id in BASE_MODELS:
+            short = model_short_name(model_id)
+            ckpt_dir = OUTPUTS_DIR / "noisy" / key / "fusion"
+            ckpt_path = ckpt_dir / f"fusion_{short}.pt"
+            if not ckpt_path.exists():
+                print(f"  Training fusion {short}...")
+                m = train_fusion(model_id, tr_noisy, val_noisy, te_noisy, csv_path, ckpt_dir, device)
+                results["noisy"][key]["fusion"][short] = m
+            else:
+                metrics = evaluate_fusion_model(model_id, ckpt_path, te_noisy, csv_path, device)
+                results["noisy"][key]["fusion"][short] = metrics
 
-    # 4a. HuBERT frozen + LR (same as 07 "HuBERT Embeddings Only" — fair comparison to Fusion)
-    print("\nEvaluating HuBERT (frozen + LR, same as notebook 07)...")
-    model_frozen = AutoModelForAudioClassification.from_pretrained(BEST_TRANSFORMER, num_labels=2)
-    feat_ext_frozen = AutoFeatureExtractor.from_pretrained(BEST_TRANSFORMER)
-    model_frozen = model_frozen.to(device)
-    train_arrays_emb = []
-    for p in train_paths:
-        y = load_audio(p, sr=SAMPLE_RATE)
-        if len(y) > MAX_AUDIO_SAMPLES:
-            start = (len(y) - MAX_AUDIO_SAMPLES) // 2
-            y = y[start : start + MAX_AUDIO_SAMPLES]
-        elif len(y) < MAX_AUDIO_SAMPLES:
-            y = np.pad(y, (0, MAX_AUDIO_SAMPLES - len(y)), mode="constant")
-        train_arrays_emb.append(y.astype(np.float32))
-    tr_emb_only = extract_embeddings_from_arrays(model_frozen, feat_ext_frozen, train_arrays_emb, device)
-    scaler_emb = StandardScaler()
-    X_tr_emb_s = scaler_emb.fit_transform(tr_emb_only)
-    lr_emb = LogisticRegression(C=LR_C, max_iter=1000, random_state=RANDOM_SEED)
-    lr_emb.fit(X_tr_emb_s, train_labels)
-    hubert_frozen_state = {"scaler": scaler_emb, "lr": lr_emb, "model": model_frozen, "feature_extractor": feat_ext_frozen}
-    results["hubert_frozen_lr"] = {}
+    # --- Part 5 & 6: Comparison tables and plots ---
+    # Build comparison DataFrame
+    snr_labels = ["clean"] + [f"{int(s)}dB" for s in SNR_LEVELS_NOISY]
+
+    # For each noise type, build table
+    tables = {}
     for noise_type in NOISE_TYPES:
-        results["hubert_frozen_lr"][noise_type] = {}
-        for snr in SNR_LEVELS_DB:
-            label = "clean" if snr == float("inf") else f"{int(snr)}dB"
-            m = evaluate_frozen_hubert_lr(test_paths, test_labels, noise_type, snr, hubert_frozen_state, device, rng)
-            results["hubert_frozen_lr"][noise_type][label] = {"auc": m["auc_roc"], "f1": m["f1"]}
-            print(f"  {noise_type} {label}: AUC={m['auc_roc']:.3f}")
+        rows = []
+        for model_name in ["hubert_base_ls960", "wavlm"]:
+            base_row = {"Model": f"{model_name} (base)", "Clean AUC": "-", "20dB": "-", "10dB": "-", "5dB": "-", "0dB": "-"}
+            fusion_row = {"Model": f"{model_name} (fusion)", "Clean AUC": "-", "20dB": "-", "10dB": "-", "5dB": "-", "0dB": "-"}
 
-    # 4b. Fusion (frozen HuBERT + acoustic features + LR)
-    print("\nEvaluating Fusion (HuBERT + Acoustic)...")
-    model = AutoModelForAudioClassification.from_pretrained(BEST_TRANSFORMER, num_labels=2)
-    feature_extractor = AutoFeatureExtractor.from_pretrained(BEST_TRANSFORMER)
-    model = model.to(device)
-    # Extract embeddings from clean train
-    train_arrays = []
-    for p in train_paths:
-        y = load_audio(p, sr=SAMPLE_RATE)
-        if len(y) > MAX_AUDIO_SAMPLES:
-            start = (len(y) - MAX_AUDIO_SAMPLES) // 2
-            y = y[start : start + MAX_AUDIO_SAMPLES]
-        elif len(y) < MAX_AUDIO_SAMPLES:
-            y = np.pad(y, (0, MAX_AUDIO_SAMPLES - len(y)), mode="constant")
-        train_arrays.append(y.astype(np.float32))
-    tr_emb = extract_embeddings_from_arrays(model, feature_extractor, train_arrays, device)
-    # Extract acoustic from clean train
-    X_tr_ac = []
-    for p in train_paths:
-        y = load_audio(p, sr=SAMPLE_RATE)
-        feat = extract_all_features(
-            y, sr=SAMPLE_RATE, n_mfcc=13, n_mels=N_MELS, hop_length=HOP_LENGTH,
-            n_fft=N_FFT, f0_fmin=F0_FMIN, f0_fmax=F0_FMAX,
-        )
-        X_tr_ac.append(features_to_vector(feat))
-    X_tr_ac = np.array(X_tr_ac)
-    X_tr_ac = np.nan_to_num(X_tr_ac, nan=np.nanmedian(X_tr_ac, axis=0))
-    sel_idx = select_acoustic_features(X_tr_ac, train_labels, top_n=FUSION_TOP_ACOUSTIC_N, corr_threshold=FUSION_CORR_THRESHOLD)
-    X_tr_ac = X_tr_ac[:, sel_idx]
-    X_tr = np.hstack([tr_emb, X_tr_ac])
-    scaler = StandardScaler()
-    X_tr_s = scaler.fit_transform(X_tr)
-    lr = LogisticRegression(C=LR_C, max_iter=1000, random_state=RANDOM_SEED)
-    lr.fit(X_tr_s, train_labels)
-    fusion_state = {"scaler": scaler, "lr": lr, "sel_idx": sel_idx, "model": model, "feature_extractor": feature_extractor}
-    results["fusion"] = {}
+            if results["clean"]["base"].get(model_name) and results["clean"]["base"][model_name]:
+                base_row["Clean AUC"] = f"{results['clean']['base'][model_name]['auc_roc']:.3f}"
+            if results["clean"]["fusion"].get(model_name) and results["clean"]["fusion"][model_name]:
+                fusion_row["Clean AUC"] = f"{results['clean']['fusion'][model_name]['auc_roc']:.3f}"
+
+            for snr in SNR_LEVELS_NOISY:
+                key = f"{noise_type}_{int(snr)}dB"
+                if key in results["noisy"]:
+                    b = results["noisy"][key]["base"].get(model_name, {})
+                    f = results["noisy"][key]["fusion"].get(model_name, {})
+                    base_row[f"{int(snr)}dB"] = f"{b.get('auc_roc', 0):.3f}" if b else "-"
+                    fusion_row[f"{int(snr)}dB"] = f"{f.get('auc_roc', 0):.3f}" if f else "-"
+
+            rows.append(base_row)
+            rows.append(fusion_row)
+        tables[noise_type] = pd.DataFrame(rows)
+
+    # --- Part 6: Plots ---
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+
+    for ax_idx, noise_type in enumerate(NOISE_TYPES):
+        ax_auc = axes[0, ax_idx] if len(NOISE_TYPES) > 1 else axes[ax_idx]
+        ax_f1 = axes[1, ax_idx] if len(NOISE_TYPES) > 1 else axes[ax_idx + 2]
+
+        x = ["clean"] + [f"{s}dB" for s in SNR_LEVELS_NOISY]
+        for model_name in ["hubert_base_ls960", "wavlm"]:
+            auc_vals = []
+            f1_vals = []
+            m = results["clean"]["base"].get(model_name)
+            if m and isinstance(m, dict):
+                auc_vals.append(m.get("auc_roc", np.nan))
+                f1_vals.append(m.get("f1", np.nan))
+            else:
+                auc_vals.append(np.nan)
+                f1_vals.append(np.nan)
+            for snr in SNR_LEVELS_NOISY:
+                key = f"{noise_type}_{int(snr)}dB"
+                m = results["noisy"].get(key, {}).get("base", {}).get(model_name, {})
+                auc_vals.append(m.get("auc_roc", np.nan))
+                f1_vals.append(m.get("f1", np.nan))
+
+            ax_auc.plot(x, auc_vals, "-o", label=f"{model_name} base")
+            ax_f1.plot(x, f1_vals, "-o", label=f"{model_name} base")
+
+            mf = results["clean"]["fusion"].get(model_name)
+            auc_vals = [mf.get("auc_roc", np.nan) if mf else np.nan]
+            f1_vals = [mf.get("f1", np.nan) if mf else np.nan]
+            for snr in SNR_LEVELS_NOISY:
+                key = f"{noise_type}_{int(snr)}dB"
+                m = results["noisy"].get(key, {}).get("fusion", {}).get(model_name, {})
+                auc_vals.append(m.get("auc_roc", np.nan))
+                f1_vals.append(m.get("f1", np.nan))
+            ax_auc.plot(x, auc_vals, "--s", label=f"{model_name} fusion")
+            ax_f1.plot(x, f1_vals, "--s", label=f"{model_name} fusion")
+
+        ax_auc.set_title(f"{noise_type} - AUC vs SNR")
+        ax_auc.set_ylim(0, 1.05)
+        ax_auc.legend()
+        ax_f1.set_title(f"{noise_type} - F1 vs SNR")
+        ax_f1.set_ylim(0, 1.05)
+        ax_f1.legend()
+
+    plt.tight_layout()
+    plt.savefig(REPORTS_DIR / "noise_robustness_comparison.png", dpi=150, bbox_inches="tight")
+    plt.close()
+
+    # --- Part 7: Analysis ---
+    analysis = []
     for noise_type in NOISE_TYPES:
-        results["fusion"][noise_type] = {}
-        for snr in SNR_LEVELS_DB:
-            label = "clean" if snr == float("inf") else f"{int(snr)}dB"
-            m = evaluate_fusion(test_paths, test_labels, noise_type, snr, fusion_state, device, rng)
-            results["fusion"][noise_type][label] = {"auc": m["auc_roc"], "f1": m["f1"]}
-            print(f"  {noise_type} {label}: AUC={m['auc_roc']:.3f}")
+        for snr in SNR_LEVELS_NOISY:
+            key = f"{noise_type}_{int(snr)}dB"
+            if key not in results["noisy"]:
+                continue
+            base_aucs = [results["noisy"][key]["base"].get(m, {}).get("auc_roc", 0) for m in ["hubert_base_ls960", "wavlm"]]
+            fusion_aucs = [results["noisy"][key]["fusion"].get(m, {}).get("auc_roc", 0) for m in ["hubert_base_ls960", "wavlm"]]
+            avg_base = np.nanmean(base_aucs) if base_aucs else 0
+            avg_fusion = np.nanmean(fusion_aucs) if fusion_aucs else 0
+            if avg_fusion > avg_base + 0.02:
+                analysis.append(f"{key}: Fusion improves robustness (fusion={avg_fusion:.2f} vs base={avg_base:.2f})")
+            elif avg_base > avg_fusion + 0.02:
+                analysis.append(f"{key}: Base more robust (base={avg_base:.2f} vs fusion={avg_fusion:.2f})")
+            else:
+                analysis.append(f"{key}: Similar performance (base={avg_base:.2f}, fusion={avg_fusion:.2f})")
 
-    with open(OUTPUTS_DIR / "noise_robustness_results.json", "w") as f:
-        json.dump(results, f, indent=2)
-    print(f"\nSaved to {OUTPUTS_DIR / 'noise_robustness_results.json'}")
+    # --- Part 8: Save results ---
+    def _serialize_metrics(m):
+        if m is None:
+            return None
+        return {kk: vv for kk, vv in m.items()}
+
+    out = {
+        "clean": {
+            "base": {k: _serialize_metrics(v) for k, v in results["clean"]["base"].items()},
+            "fusion": {k: _serialize_metrics(v) for k, v in results["clean"]["fusion"].items()},
+        },
+        "noisy": {
+            k: {
+                "base": {m: _serialize_metrics(v) for m, v in data["base"].items()},
+                "fusion": {m: _serialize_metrics(v) for m, v in data["fusion"].items()},
+            }
+            for k, data in results["noisy"].items()
+        },
+        "tables": {k: v.to_dict(orient="records") for k, v in tables.items()},
+        "analysis": analysis,
+    }
+
+    out_path = RESULTS_DIR / "noise_robustness.json"
+    with open(out_path, "w") as f:
+        json.dump(out, f, indent=2)
+
+    print(f"\nSaved to {out_path}")
+    print("\n=== Analysis ===")
+    for line in analysis:
+        print(f"  {line}")
+
     return 0
 
 

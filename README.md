@@ -28,11 +28,14 @@ python download_dataset.py
 python scripts/run_preprocessing.py
 python scripts/extract_features.py
 
-# אימון מודלים
-python scripts/train_baseline.py
-python scripts/train_cnn.py
-python scripts/train_transformers.py
-python scripts/experiment_fusion_ab.py
+# אימון מודלים (בסדר: CNN → טרנספורמרים → Fusion → רעש)
+python scripts/run_pipeline.py
+
+# יצירת דוח סופי
+python scripts/generate_report.py
+
+# אופציונלי: baseline קלאסי (RF/LR על פיצ'רים אקוסטיים)
+# python scripts/train_baseline.py
 
 # הסקה על קובץ בודד
 python scripts/predict.py path/to/audio.wav
@@ -42,11 +45,13 @@ python scripts/predict.py path/to/audio.wav
 
 | תיקייה | תיאור |
 |--------|-------|
-| `notebooks/` | ניתוח וניסויים |
+| `notebooks/` | ניתוח וניסויים (01–09) |
 | `scripts/` | סקריפטי אימון והרצה |
-| `src/` | קוד משותף |
-| `outputs/` | תוצאות ומודלים |
+| `src/` | קוד משותף (features, models, utils) |
+| `data/` | raw, processed, features |
+| `results/` | תוצאות אימון, מטריקות, checkpoints |
+| `reports/` | דוח סופי (final_report.md) |
 
-לפרטים נוספים: `PIPELINE.md`, `outputs/final_report.md`
+לפרטים נוספים: `PIPELINE.md`, `PROJECT_STRUCTURE.md`, `reports/final_report.md`
 
 </div>

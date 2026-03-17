@@ -51,7 +51,7 @@ def evaluate_binary(y_true: np.ndarray, y_pred: np.ndarray, y_prob: np.ndarray =
         "precision": float(precision_score(y_true, y_pred, zero_division=0)),
         "recall": float(recall_score(y_true, y_pred, zero_division=0)),
         "f1": float(f1_score(y_true, y_pred, zero_division=0)),
-        "confusion_matrix": confusion_matrix(y_true, y_pred).tolist(),
+        "confusion_matrix": confusion_matrix(y_true, y_pred, labels=[0, 1]).tolist(),
     }
     if y_prob is not None and len(np.unique(y_true)) == 2:
         fpr, tpr, _ = roc_curve(y_true, y_prob)
