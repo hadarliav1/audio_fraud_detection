@@ -1,0 +1,6 @@
+{
+  "NOISE_TYPES": ["compression"],
+  "SNR_LEVELS_NOISY": [0, 10],
+  "MODELS": ["hubert_base_ls960", "wavlm"],
+  "MAX_CONDITIONS": 2
+}

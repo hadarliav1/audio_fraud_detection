@@ -247,10 +247,14 @@ def main() -> int:
     print(f"Device: {device}")
 
     all_results = {}
-    # Only run fusion for the two best transformer models
+    # Fusion models to train (Stage 7):
+    # - HuBERT + acoustic features
+    # - WavLM + acoustic features
+    # - Whisper + acoustic features (bonus, heavier compute)
     FUSION_MODELS = [
         "microsoft/wavlm-base",
         "facebook/hubert-base-ls960",
+        "openai/whisper-tiny",
     ]
 
     for model_id in FUSION_MODELS:

@@ -65,6 +65,20 @@ REPORTS_DIR = PROJECT_ROOT / "reports"
 BASE_MODELS = ["facebook/hubert-base-ls960", "microsoft/wavlm-base"]
 
 
+def load_colab_override() -> dict:
+    """Optional override for Colab CPU runs to limit conditions/models.
+    Keys: NOISE_TYPES, SNR_LEVELS_NOISY, MODELS, MAX_CONDITIONS (stop after N conditions, save partial).
+    """
+    p = RESULTS_DIR / "stage8_colab_override.json"
+    if not p.exists():
+        return {}
+    try:
+        with open(p) as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+
 def model_short_name(model_id: str) -> str:
     name = model_id.split("/")[-1].split(".")[0]
     for suffix in ["-base", "-tiny", "-small", "_base", "_tiny", "_small"]:
@@ -76,12 +90,16 @@ def model_short_name(model_id: str) -> str:
 
 def ensure_noisy_datasets(tr_pairs, val_pairs, test_pairs) -> dict:
     """Create noisy datasets if not present. Return metadata for each condition."""
+    override = load_colab_override()
+    noise_types = override.get("NOISE_TYPES", NOISE_TYPES)
+    snrs = override.get("SNR_LEVELS_NOISY", SNR_LEVELS_NOISY)
+
     NOISY_DATA_DIR.mkdir(parents=True, exist_ok=True)
     metadata_dir = NOISY_DATA_DIR / "metadata"
     all_meta = {}
 
-    for noise_type in NOISE_TYPES:
-        for snr_db in SNR_LEVELS_NOISY:
+    for noise_type in noise_types:
+        for snr_db in snrs:
             key = get_noisy_subdir_name(noise_type, snr_db)
             meta_path = metadata_dir / f"{key}.json"
 
@@ -222,6 +240,7 @@ def train_fusion(
     acoustic_csv: Path,
     ckpt_dir: Path,
     device,
+    override: dict = None,
 ) -> dict:
     """Train fusion model. Acoustic features from noisy csv; scaler fit on noisy train only."""
     short = model_short_name(model_id)
@@ -284,15 +303,18 @@ def train_fusion(
     model = TransformerFusionModel(model_id, acoustic_dim=acoustic_dim).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
     criterion = nn.CrossEntropyLoss()
-    num_steps = MAX_EPOCHS * len(train_loader)
-    scheduler = get_linear_schedule_with_warmup(optimizer, int(0.1 * num_steps), num_steps)
 
     best_val_auc = 0.0
     patience_counter = 0
     ckpt_path = ckpt_dir / f"fusion_{short}.pt"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    for epoch in range(1, MAX_EPOCHS + 1):
+    override = override or {}
+    fusion_epochs = int(override.get("FUSION_EPOCHS", MAX_EPOCHS))
+    num_steps = fusion_epochs * len(train_loader)
+    scheduler = get_linear_schedule_with_warmup(optimizer, int(0.1 * num_steps), num_steps)
+
+    for epoch in range(1, fusion_epochs + 1):
         model.train()
         for batch in tqdm(train_loader, desc=f"{short} epoch {epoch}", leave=False):
             optimizer.zero_grad()
@@ -487,6 +509,14 @@ def main() -> int:
     tr_pairs, val_pairs, test_pairs = loaded
     print(f"Split: train={len(tr_pairs)}, val={len(val_pairs)}, test={len(test_pairs)}")
 
+    override = load_colab_override()
+    noise_types = override.get("NOISE_TYPES", NOISE_TYPES)
+    snrs = override.get("SNR_LEVELS_NOISY", SNR_LEVELS_NOISY)
+    model_shorts = set(override.get("MODELS", ["hubert_base_ls960", "wavlm"]))
+    base_models = [m for m in BASE_MODELS if model_short_name(m) in model_shorts]
+    if override:
+        print(f"Override active: noise_types={noise_types}, snrs={snrs}, models={sorted(model_shorts)}")
+
     # --- Part 1: Create noisy datasets ---
     print("\n=== Part 1: Noisy datasets ===")
     all_meta = ensure_noisy_datasets(tr_pairs, val_pairs, test_pairs)
@@ -534,7 +564,105 @@ def main() -> int:
         "thresholds": {},
     }
 
-    for key in sorted(all_meta.keys()):
+    def _key_ok(k: str) -> bool:
+        # k is like: white_20dB
+        if not any(k.startswith(f"{nt}_") for nt in noise_types):
+            return False
+        try:
+            snr = int(k.split("_")[-1].replace("dB", ""))
+        except Exception:
+            return False
+        return snr in set(int(s) for s in snrs)
+
+    def _save_and_plot(results, suffix: str = "", print_analysis: bool = False):
+        """Save partial or full results to JSON and PNG. Call after each condition."""
+        def _serialize(m):
+            if m is None:
+                return None
+            return {kk: vv for kk, vv in m.items()}
+        tables = {}
+        for nt in noise_types:
+            rows = []
+            for mn in [m for m in ["hubert_base_ls960", "wavlm"] if m in model_shorts]:
+                base_row = {"Model": f"{mn} (base)", "Clean AUC": "-", **{f"{s}dB": "-" for s in snrs}}
+                fusion_row = {"Model": f"{mn} (fusion)", "Clean AUC": "-", **{f"{s}dB": "-" for s in snrs}}
+                if results["clean"]["base"].get(mn):
+                    base_row["Clean AUC"] = f"{results['clean']['base'][mn]['auc_roc']:.3f}"
+                if results["clean"]["fusion"].get(mn):
+                    fusion_row["Clean AUC"] = f"{results['clean']['fusion'][mn]['auc_roc']:.3f}"
+                for s in snrs:
+                    k = f"{nt}_{int(s)}dB"
+                    if k in results["noisy"]:
+                        b = results["noisy"][k]["base"].get(mn, {})
+                        f = results["noisy"][k]["fusion"].get(mn, {})
+                        base_row[f"{int(s)}dB"] = f"{b.get('auc_roc', 0):.3f}" if b else "-"
+                        fusion_row[f"{int(s)}dB"] = f"{f.get('auc_roc', 0):.3f}" if f else "-"
+                rows.extend([base_row, fusion_row])
+            tables[nt] = pd.DataFrame(rows)
+        analysis = []
+        for nt in noise_types:
+            for s in snrs:
+                k = f"{nt}_{int(s)}dB"
+                if k not in results["noisy"]:
+                    continue
+                base_aucs = [results["noisy"][k]["base"].get(m, {}).get("auc_roc", 0) for m in ["hubert_base_ls960", "wavlm"] if m in model_shorts]
+                fusion_aucs = [results["noisy"][k]["fusion"].get(m, {}).get("auc_roc", 0) for m in ["hubert_base_ls960", "wavlm"] if m in model_shorts]
+                ab, af = (np.nanmean(base_aucs) if base_aucs else 0), (np.nanmean(fusion_aucs) if fusion_aucs else 0)
+                if af > ab + 0.02:
+                    analysis.append(f"{k}: Fusion improves (fusion={af:.2f} vs base={ab:.2f})")
+                elif ab > af + 0.02:
+                    analysis.append(f"{k}: Base more robust (base={ab:.2f} vs fusion={af:.2f})")
+                else:
+                    analysis.append(f"{k}: Similar (base={ab:.2f}, fusion={af:.2f})")
+        fig, axes = plt.subplots(2, max(1, len(noise_types)), figsize=(6 * max(1, len(noise_types)), 10))
+        if len(noise_types) == 1:
+            axes = np.array([[axes[0]], [axes[1]]])
+        for ax_idx, nt in enumerate(noise_types):
+            ax_auc, ax_f1 = axes[0, ax_idx], axes[1, ax_idx]
+            x = ["clean"] + [f"{s}dB" for s in snrs]
+            for mn in [m for m in ["hubert_base_ls960", "wavlm"] if m in model_shorts]:
+                auc_vals = [results["clean"]["base"].get(mn, {}).get("auc_roc", np.nan) if results["clean"]["base"].get(mn) else np.nan]
+                f1_vals = [results["clean"]["base"].get(mn, {}).get("f1", np.nan) if results["clean"]["base"].get(mn) else np.nan]
+                for s in snrs:
+                    m = results["noisy"].get(f"{nt}_{int(s)}dB", {}).get("base", {}).get(mn, {})
+                    auc_vals.append(m.get("auc_roc", np.nan))
+                    f1_vals.append(m.get("f1", np.nan))
+                ax_auc.plot(x, auc_vals, "-o", label=f"{mn} base")
+                ax_f1.plot(x, f1_vals, "-o", label=f"{mn} base")
+                auc_vals = [results["clean"]["fusion"].get(mn, {}).get("auc_roc", np.nan) if results["clean"]["fusion"].get(mn) else np.nan]
+                f1_vals = [results["clean"]["fusion"].get(mn, {}).get("f1", np.nan) if results["clean"]["fusion"].get(mn) else np.nan]
+                for s in snrs:
+                    m = results["noisy"].get(f"{nt}_{int(s)}dB", {}).get("fusion", {}).get(mn, {})
+                    auc_vals.append(m.get("auc_roc", np.nan))
+                    f1_vals.append(m.get("f1", np.nan))
+                ax_auc.plot(x, auc_vals, "--s", label=f"{mn} fusion")
+                ax_f1.plot(x, f1_vals, "--s", label=f"{mn} fusion")
+            ax_auc.set_title(f"{nt} - AUC vs SNR"); ax_auc.set_ylim(0, 1.05); ax_auc.legend()
+            ax_f1.set_title(f"{nt} - F1 vs SNR"); ax_f1.set_ylim(0, 1.05); ax_f1.legend()
+        plt.tight_layout()
+        plot_path = REPORTS_DIR / f"noise_robustness_comparison{suffix}.png"
+        plt.savefig(plot_path, dpi=150, bbox_inches="tight")
+        plt.close()
+        out = {
+            "clean": {"base": {k: _serialize(v) for k, v in results["clean"]["base"].items()},
+                       "fusion": {k: _serialize(v) for k, v in results["clean"]["fusion"].items()}},
+            "noisy": {k: {"base": {m: _serialize(v) for m, v in d["base"].items()},
+                         "fusion": {m: _serialize(v) for m, v in d["fusion"].items()}}
+                  for k, d in results["noisy"].items()},
+            "tables": {k: v.to_dict(orient="records") for k, v in tables.items()},
+            "analysis": analysis,
+        }
+        out_path = RESULTS_DIR / f"noise_robustness{suffix}.json"
+        with open(out_path, "w") as f:
+            json.dump(out, f, indent=2)
+        n = len(results["noisy"])
+        print(f"  [Checkpoint] Saved {out_path} and {plot_path} ({n} condition(s))")
+        if print_analysis and analysis:
+            print("\n=== Analysis ===")
+            for line in analysis:
+                print(f"  {line}")
+
+    for key in sorted([k for k in all_meta.keys() if _key_ok(k)]):
         print(f"\n=== Condition: {key} ===")
         meta = all_meta[key]
         root = Path(meta["root"])
@@ -554,7 +682,7 @@ def main() -> int:
         results["noisy"][key] = {"base": {}, "fusion": {}}
 
         # Train base transformers
-        for model_id in BASE_MODELS:
+        for model_id in base_models:
             short = model_short_name(model_id)
             out_dir = OUTPUTS_DIR / "noisy" / key / f"transformer_{short}"
             if not (out_dir / "config.json").exists():
@@ -569,144 +697,27 @@ def main() -> int:
             results["noisy"][key]["base"][short] = metrics
 
         # Train fusion models
-        for model_id in BASE_MODELS:
+        for model_id in base_models:
             short = model_short_name(model_id)
             ckpt_dir = OUTPUTS_DIR / "noisy" / key / "fusion"
             ckpt_path = ckpt_dir / f"fusion_{short}.pt"
             if not ckpt_path.exists():
                 print(f"  Training fusion {short}...")
-                m = train_fusion(model_id, tr_noisy, val_noisy, te_noisy, csv_path, ckpt_dir, device)
+                m = train_fusion(model_id, tr_noisy, val_noisy, te_noisy, csv_path, ckpt_dir, device, override)
                 results["noisy"][key]["fusion"][short] = m
             else:
                 metrics = evaluate_fusion_model(model_id, ckpt_path, te_noisy, csv_path, device)
                 results["noisy"][key]["fusion"][short] = metrics
 
-    # --- Part 5 & 6: Comparison tables and plots ---
-    # Build comparison DataFrame
-    snr_labels = ["clean"] + [f"{int(s)}dB" for s in SNR_LEVELS_NOISY]
+        # Save partial results after each condition (so you have data if run stops)
+        _save_and_plot(results)
+        max_cond = override.get("MAX_CONDITIONS")
+        if max_cond is not None and len(results["noisy"]) >= int(max_cond):
+            print(f"\n[Stopped after {max_cond} condition(s) per MAX_CONDITIONS]")
+            break
 
-    # For each noise type, build table
-    tables = {}
-    for noise_type in NOISE_TYPES:
-        rows = []
-        for model_name in ["hubert_base_ls960", "wavlm"]:
-            base_row = {"Model": f"{model_name} (base)", "Clean AUC": "-", "20dB": "-", "10dB": "-", "5dB": "-", "0dB": "-"}
-            fusion_row = {"Model": f"{model_name} (fusion)", "Clean AUC": "-", "20dB": "-", "10dB": "-", "5dB": "-", "0dB": "-"}
-
-            if results["clean"]["base"].get(model_name) and results["clean"]["base"][model_name]:
-                base_row["Clean AUC"] = f"{results['clean']['base'][model_name]['auc_roc']:.3f}"
-            if results["clean"]["fusion"].get(model_name) and results["clean"]["fusion"][model_name]:
-                fusion_row["Clean AUC"] = f"{results['clean']['fusion'][model_name]['auc_roc']:.3f}"
-
-            for snr in SNR_LEVELS_NOISY:
-                key = f"{noise_type}_{int(snr)}dB"
-                if key in results["noisy"]:
-                    b = results["noisy"][key]["base"].get(model_name, {})
-                    f = results["noisy"][key]["fusion"].get(model_name, {})
-                    base_row[f"{int(snr)}dB"] = f"{b.get('auc_roc', 0):.3f}" if b else "-"
-                    fusion_row[f"{int(snr)}dB"] = f"{f.get('auc_roc', 0):.3f}" if f else "-"
-
-            rows.append(base_row)
-            rows.append(fusion_row)
-        tables[noise_type] = pd.DataFrame(rows)
-
-    # --- Part 6: Plots ---
-    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-
-    for ax_idx, noise_type in enumerate(NOISE_TYPES):
-        ax_auc = axes[0, ax_idx] if len(NOISE_TYPES) > 1 else axes[ax_idx]
-        ax_f1 = axes[1, ax_idx] if len(NOISE_TYPES) > 1 else axes[ax_idx + 2]
-
-        x = ["clean"] + [f"{s}dB" for s in SNR_LEVELS_NOISY]
-        for model_name in ["hubert_base_ls960", "wavlm"]:
-            auc_vals = []
-            f1_vals = []
-            m = results["clean"]["base"].get(model_name)
-            if m and isinstance(m, dict):
-                auc_vals.append(m.get("auc_roc", np.nan))
-                f1_vals.append(m.get("f1", np.nan))
-            else:
-                auc_vals.append(np.nan)
-                f1_vals.append(np.nan)
-            for snr in SNR_LEVELS_NOISY:
-                key = f"{noise_type}_{int(snr)}dB"
-                m = results["noisy"].get(key, {}).get("base", {}).get(model_name, {})
-                auc_vals.append(m.get("auc_roc", np.nan))
-                f1_vals.append(m.get("f1", np.nan))
-
-            ax_auc.plot(x, auc_vals, "-o", label=f"{model_name} base")
-            ax_f1.plot(x, f1_vals, "-o", label=f"{model_name} base")
-
-            mf = results["clean"]["fusion"].get(model_name)
-            auc_vals = [mf.get("auc_roc", np.nan) if mf else np.nan]
-            f1_vals = [mf.get("f1", np.nan) if mf else np.nan]
-            for snr in SNR_LEVELS_NOISY:
-                key = f"{noise_type}_{int(snr)}dB"
-                m = results["noisy"].get(key, {}).get("fusion", {}).get(model_name, {})
-                auc_vals.append(m.get("auc_roc", np.nan))
-                f1_vals.append(m.get("f1", np.nan))
-            ax_auc.plot(x, auc_vals, "--s", label=f"{model_name} fusion")
-            ax_f1.plot(x, f1_vals, "--s", label=f"{model_name} fusion")
-
-        ax_auc.set_title(f"{noise_type} - AUC vs SNR")
-        ax_auc.set_ylim(0, 1.05)
-        ax_auc.legend()
-        ax_f1.set_title(f"{noise_type} - F1 vs SNR")
-        ax_f1.set_ylim(0, 1.05)
-        ax_f1.legend()
-
-    plt.tight_layout()
-    plt.savefig(REPORTS_DIR / "noise_robustness_comparison.png", dpi=150, bbox_inches="tight")
-    plt.close()
-
-    # --- Part 7: Analysis ---
-    analysis = []
-    for noise_type in NOISE_TYPES:
-        for snr in SNR_LEVELS_NOISY:
-            key = f"{noise_type}_{int(snr)}dB"
-            if key not in results["noisy"]:
-                continue
-            base_aucs = [results["noisy"][key]["base"].get(m, {}).get("auc_roc", 0) for m in ["hubert_base_ls960", "wavlm"]]
-            fusion_aucs = [results["noisy"][key]["fusion"].get(m, {}).get("auc_roc", 0) for m in ["hubert_base_ls960", "wavlm"]]
-            avg_base = np.nanmean(base_aucs) if base_aucs else 0
-            avg_fusion = np.nanmean(fusion_aucs) if fusion_aucs else 0
-            if avg_fusion > avg_base + 0.02:
-                analysis.append(f"{key}: Fusion improves robustness (fusion={avg_fusion:.2f} vs base={avg_base:.2f})")
-            elif avg_base > avg_fusion + 0.02:
-                analysis.append(f"{key}: Base more robust (base={avg_base:.2f} vs fusion={avg_fusion:.2f})")
-            else:
-                analysis.append(f"{key}: Similar performance (base={avg_base:.2f}, fusion={avg_fusion:.2f})")
-
-    # --- Part 8: Save results ---
-    def _serialize_metrics(m):
-        if m is None:
-            return None
-        return {kk: vv for kk, vv in m.items()}
-
-    out = {
-        "clean": {
-            "base": {k: _serialize_metrics(v) for k, v in results["clean"]["base"].items()},
-            "fusion": {k: _serialize_metrics(v) for k, v in results["clean"]["fusion"].items()},
-        },
-        "noisy": {
-            k: {
-                "base": {m: _serialize_metrics(v) for m, v in data["base"].items()},
-                "fusion": {m: _serialize_metrics(v) for m, v in data["fusion"].items()},
-            }
-            for k, data in results["noisy"].items()
-        },
-        "tables": {k: v.to_dict(orient="records") for k, v in tables.items()},
-        "analysis": analysis,
-    }
-
-    out_path = RESULTS_DIR / "noise_robustness.json"
-    with open(out_path, "w") as f:
-        json.dump(out, f, indent=2)
-
-    print(f"\nSaved to {out_path}")
-    print("\n=== Analysis ===")
-    for line in analysis:
-        print(f"  {line}")
+    # --- Part 5-8: Final save and report ---
+    _save_and_plot(results, print_analysis=True)
 
     return 0
 
